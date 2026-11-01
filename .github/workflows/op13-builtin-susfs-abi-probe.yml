@@ -860,6 +860,13 @@ jobs:
             echo "::error::EXP kpimg missing the Nohello compatibility symbol"
             exit 1
           }
+          # kptools shares the kpimg ABI declared in kernel/include/preset.h.
+          # Copy the exact same-revision header; never fabricate ABI structs.
+          test -s kpn-exp/kernel/include/preset.h
+          test ! -e kpn-exp/tools/preset.h
+          cp kpn-exp/kernel/include/preset.h kpn-exp/tools/preset.h
+          cmp -s kpn-exp/kernel/include/preset.h kpn-exp/tools/preset.h
+          grep -Fq '#define EXTRA_ALIGN 0x10' kpn-exp/tools/preset.h
           make -C kpn-exp/tools -j2 CC=gcc
           test -x kpn-exp/tools/kptools
           echo "KPN EXP core: $KPN_EXP_SHA"
