@@ -290,6 +290,12 @@ jobs:
             done
             grep -Fq 'ksu_mount_hide_init();' kernel/hook/setuid_hook.c || { echo "::error::SukiSU mount_hide initialization missing"; exit 1; }
             grep -Fq 'ksu_setuid_hook_init();' kernel/hook/syscall_hook_manager.c || { echo "::error::SukiSU setuid mount-hide hook chain missing"; exit 1; }
+            grep -Fq 'feature/mount_hide.o' kernel/Kbuild || { echo "::error::SukiSU mount_hide implementation missing from kernel link"; exit 1; }
+            # Verify the six mount_hide targets exist in this OnePlus OKI source.
+            # Actual kallsyms resolution and hooks still require a post-boot probe.
+            for symbol in show_vfsmnt show_mountinfo show_vfsstat proc_mounts_operations proc_mountinfo_operations proc_mountstats_operations; do
+              grep -wq "$symbol" ../common/fs/proc_namespace.c || { echo "::error::OnePlus source missing mount_hide symbol: $symbol"; exit 1; }
+            done
             for feature_name in kernel_umount mount_hide selinux_hide avc_spoof sulog adb_root shell_su_adb_only; do
               grep -Fq "\"$feature_name\"" kernel/policy/feature.c || { echo "::error::Missing kernel feature ABI registration: $feature_name"; exit 1; }
             done
