@@ -250,16 +250,25 @@ jobs:
         run: |
           # 进入内核工作目录
           cd kernel_workspace
-          if [[ ${{ github.event.inputs.ksu_type }} == "sukisu" || ${{ github.event.inputs.ksu_type }} == "bakasu" ]]; then
-            echo "正在配置BakaSU（由于SukiSU长期未维护无法正常编译，且BakaSU兼容sukisu管理器，故SukiSU源码仓库已重定向为bakasu）..."
-            curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/refs/heads/main/kernel/setup.sh" | bash -s main
+          if [[ ${{ github.event.inputs.ksu_type }} == "bakasu" ]]; then
+            echo "正在配置 BakaSU main..."
+            curl -fLSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/refs/heads/main/kernel/setup.sh" | bash -s main
             echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@cctv18"' >> ./common/arch/arm64/configs/gki_defconfig
             cd ./KernelSU
-            # 生成自定义版本号（基于提交计数）, 失败时使用 114514
-            KSU_VERSION=$(expr $(git rev-list --count main) + 30700 2>/dev/null || echo 114514)
-            # 存储版本号到 GitHub 环境变量
-            echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
-            echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
+            KSU_VERSION=$(expr "$(git rev-list --count HEAD)" + 30700)
+            echo "KSUVER=$KSU_VERSION" >> "$GITHUB_ENV"
+            echo "ksuver=$KSU_VERSION" >> "$GITHUB_OUTPUT"
+          elif [[ ${{ github.event.inputs.ksu_type }} == "sukisu" ]]; then
+            echo "正在配置官方 SukiSU Ultra main（不再重定向为 BakaSU）..."
+            curl -fLSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/refs/heads/main/kernel/setup.sh" | bash -s main
+            cd ./KernelSU
+            # Obtain version constants from SukiSU's Kbuild rather than inventing a BakaSU version.
+            VERSION_BASE=$(awk '/^VERSION_BASE[[:space:]]*:=/ {print $3; exit}' kernel/Kbuild)
+            VERSION_OFFSET=$(awk '/^VERSION_OFFSET[[:space:]]*:=/ {print $3; exit}' kernel/Kbuild)
+            [[ "$VERSION_BASE" =~ ^[0-9]+$ && "$VERSION_OFFSET" =~ ^[0-9]+$ ]] || { echo "::error::SukiSU version metadata missing"; exit 1; }
+            KSU_VERSION=$((VERSION_BASE + $(git rev-list --count HEAD) - VERSION_OFFSET))
+            echo "KSUVER=$KSU_VERSION" >> "$GITHUB_ENV"
+            echo "ksuver=$KSU_VERSION" >> "$GITHUB_OUTPUT"
           elif [[ ${{ github.event.inputs.ksu_type }} == "ksunext" ]]; then
             echo "正在配置KernelSU Next..."
             curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
@@ -288,7 +297,7 @@ jobs:
           fi
 
       - name: 应用 KernelSU & SUSFS 补丁
-        if: inputs.susfs_enable
+        if: inputs.susfs_enable && inputs.ksu_type != 'none'
         run: |
           cd kernel_workspace
           if [[ ${{ github.event.inputs.ksu_type }} != "none" ]]; then
@@ -299,8 +308,12 @@ jobs:
             cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
             cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
             cd ./common
-            patch -p1 -F 3 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || true
-            patch -p1 -N -F 3 < 69_hide_stuff.patch || true
+            # Mandatory security patch: fail instead of producing an incomplete SUSFS build.
+            patch --batch --forward -p1 -F 3 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch
+            test -f fs/susfs.c && test -f include/linux/susfs.h || { echo "::error::SUSFS sources are missing"; exit 1; }
+            if ! patch --batch --forward -p1 -N -F 3 < 69_hide_stuff.patch; then
+              echo "::warning::69_hide_stuff.patch failed; please check kernel patch compatibility"
+            fi
             cd ..
           else
             echo "已选择无内置KernelSU模式，跳过susfs配置..."
@@ -341,7 +354,7 @@ jobs:
           patch -p1 -F 3 < lz4kd.patch || true
           
       - name: 添加SUSFS 配置项
-        if: inputs.susfs_enable
+        if: inputs.susfs_enable && inputs.ksu_type != 'none'
         run: |
           cd kernel_workspace
           echo "CONFIG_KSU_SUSFS=y" >> ./common/arch/arm64/configs/gki_defconfig
@@ -363,9 +376,14 @@ jobs:
       - name: 添加 KSU & 其他配置项
         run: |
           cd kernel_workspace
-          echo "CONFIG_KSU=y" >> ./common/arch/arm64/configs/gki_defconfig
-          if [[ "${{ github.event.inputs.susfs_enable }}" == "false" ]]; then
-            echo "CONFIG_KSU_SUSFS=n" >> ./common/arch/arm64/configs/gki_defconfig
+          if [[ "${{ github.event.inputs.ksu_type }}" == "none" ]]; then
+            echo "# CONFIG_KSU is not set" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "# CONFIG_KSU_SUSFS is not set" >> ./common/arch/arm64/configs/gki_defconfig
+          else
+            echo "CONFIG_KSU=y" >> ./common/arch/arm64/configs/gki_defconfig
+            if [[ "${{ github.event.inputs.susfs_enable }}" == "false" ]]; then
+              echo "# CONFIG_KSU_SUSFS is not set" >> ./common/arch/arm64/configs/gki_defconfig
+            fi
           fi
           #添加对 Mountify (backslashxx/mountify) 模块的支持
           echo "CONFIG_TMPFS_XATTR=y" >> ./common/arch/arm64/configs/gki_defconfig
@@ -534,7 +552,7 @@ jobs:
           cd kernel_workspace
           echo "CONFIG_BBG=y" >> ./common/arch/arm64/configs/gki_defconfig
           cd ./common
-          curl -sSL https://github.com/cctv18/Baseband-guard/raw/master/setup.sh | bash
+          curl -fLSs https://raw.githubusercontent.com/vc-teahouse/Baseband-guard/main/setup.sh | bash
           sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
 
       - name: 添加制作名称
@@ -629,6 +647,8 @@ jobs:
           sudo rm -rf /opt/ghc &
           sudo rm -rf /opt/hostedtoolcache/CodeQL &
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error gki_defconfig &&
+          # Official OPlus HMBIRD scheduler must remain enabled in this OKI build.
+          grep -q '^CONFIG_HMBIRD_SCHED=y$' out/.config || { echo "::error::HMBIRD/Fengchi disabled in final kernel config"; exit 1; }
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error Image
           
           # 编译后时间劫持二次校验
@@ -724,6 +744,7 @@ jobs:
           echo "Re-Kernel: ${{ github.event.inputs.rekernel_enable }}" >> ./ak3.log
           echo "BBG: ${{ github.event.inputs.baseband_guard }}" >> ./ak3.log
           zip -z ../$AK3_NAME < ./ak3.log
+          unzip -t "../$AK3_NAME" >/dev/null || { echo "::error::AK3 archive validation failed"; exit 1; }
 
       - name: 上传 Ccache 调试日志
         if: always() && inputs.ccache_debug
