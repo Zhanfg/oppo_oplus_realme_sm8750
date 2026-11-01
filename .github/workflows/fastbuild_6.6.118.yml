@@ -446,8 +446,14 @@ jobs:
           echo "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y" >> ./common/arch/arm64/configs/gki_defconfig
           #禁用 defconfig 检查
           sed -i 's/check_defconfig//' ./common/build.config.gki
-          #跳过将uapi标准头安装到 usr/include 目录的不必要操作，节省编译时间
-          echo "CONFIG_HEADERS_INSTALL=n" >> ./common/arch/arm64/configs/gki_defconfig
+          # SukiSU Ultra's embedded preinit runner is built against
+          # out/usr/include/linux/unistd.h. The old blanket disabling of
+          # CONFIG_HEADERS_INSTALL silently removed that build path.
+          if [[ "${{ github.event.inputs.ksu_type }}" == "sukisu" ]]; then
+            echo "CONFIG_HEADERS_INSTALL=y" >> ./common/arch/arm64/configs/gki_defconfig
+          else
+            echo "# CONFIG_HEADERS_INSTALL is not set" >> ./common/arch/arm64/configs/gki_defconfig
+          fi
           # 应用 CVE_2026_43499 修复补丁
           cd common
           wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/other_patch/cve-2026-43499-rtmutex-6.6.patch
@@ -694,6 +700,14 @@ jobs:
           sudo rm -rf /opt/ghc &
           sudo rm -rf /opt/hostedtoolcache/CodeQL &
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error gki_defconfig &&
+          if [[ "${{ github.event.inputs.ksu_type }}" == "sukisu" ]]; then
+            # Populate the UAPI headers required for SukiSU embedded preinit.
+            make -j$(nproc --all) LLVM=1 ARCH=arm64 O=out headers_install
+            test -f out/usr/include/linux/unistd.h || {
+              echo "::error::SukiSU preinit UAPI headers unavailable; refusing a silently reduced build"
+              exit 1
+            }
+          fi
           # Official OPlus HMBIRD scheduler must remain enabled in this OKI build.
           grep -q '^CONFIG_HMBIRD_SCHED=y$' out/.config || { echo "::error::HMBIRD/Fengchi disabled in final kernel config"; exit 1; }
           # Fail the build if critical Spectre, BPF or memory-hardening protections regress.
