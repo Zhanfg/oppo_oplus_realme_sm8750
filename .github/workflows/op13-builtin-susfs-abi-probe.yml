@@ -381,6 +381,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 tools/op13-fix-builtin-preinit.py
+          grep -Fq '#define runner_binary_len' kernel_workspace/KernelSU/kernel/preinit/preinit.c
           grep -Fq '#include "preinit/preinit.c"' kernel_workspace/KernelSU/kernel/ksu_main.c
           grep -Fq 'ksu-y += preinit/blob.o' kernel_workspace/KernelSU/kernel/Makefile
 
