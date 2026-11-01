@@ -29,6 +29,25 @@ for name in kpm cpu_spoof umount_paths dynamic_manager susfs version_spoof; do
     "$KSUD" extension check "$name" 2>&1 || echo "Probe failed: extension ABI or permission mismatch"
 done
 
+echo "--- AVC spoof diagnostic (read-only) ---"
+echo "Kernel/ksud feature ID must match SukiSU AVC_SPOOF=10003."
+echo "Device kernel: $(uname -r 2>/dev/null)"
+echo "Root uid: $(id -u 2>/dev/null)"
+"$KSUD" feature check avc_spoof 2>&1
+echo "feature check exit code: $?"
+"$KSUD" feature get avc_spoof 2>&1
+echo "feature get exit code: $?"
+"$KSUD" feature get avc_spoof --config 2>&1 || true
+echo "Kernel feature and AVC hook messages (filtered, latest 20 lines):"
+if command -v dmesg >/dev/null 2>&1; then
+    dmesg 2>/dev/null |
+      grep -E 'avc_spoof:|feature: feature 10003|feature: set_handler for 10003|set_feature: failed for feature 10003|register_slow_avc_audit' |
+      tail -n 20 || true
+fi
+echo "Interpretation: 'supported' means registered. It does not establish that"
+echo "an AVC audit hook was successfully installed or that Manager's JNI can set it."
+echo
+
 echo "--- SUSFS kernel interface ---"
 "$KSUD" susfs status 2>&1 || echo "SUSFS probe unavailable; check compatibility of ksud, kernel and SUSFS variant"
 
