@@ -837,7 +837,8 @@ jobs:
           CROSS="$(pwd)/kpn-exp-toolchain/bin/aarch64-none-elf-"
           make -C kpn-exp/kernel -j2 TARGET_COMPILE="$CROSS" kpimg
           test -s kpn-exp/kernel/kpimg
-          "${CROSS}nm" -a kpn-exp/kernel/kpimg.elf | grep -Fq '__kp_symbol_is_su_allow_uid' || {
+          "${CROSS}nm" -a kpn-exp/kernel/kpimg.elf > kpn-exp/symbols.txt
+          grep -Fq '__kp_symbol_is_su_allow_uid' kpn-exp/symbols.txt || {
             echo "::error::EXP kpimg missing the Nohello compatibility symbol"
             exit 1
           }
@@ -846,9 +847,9 @@ jobs:
           echo "KPN EXP core: $KPN_EXP_SHA"
           cd common/out/arch/arm64/boot
           test -s Image || { echo "::error::Kernel Image missing"; exit 1; }
-          ../../../..//kpn-exp/tools/kptools -p -i Image -k ../../../..//kpn-exp/kernel/kpimg -o Image-kpn-exp
+          ../../../../../kpn-exp/tools/kptools -p -i Image -k ../../../../../kpn-exp/kernel/kpimg -o Image-kpn-exp
           test -s Image-kpn-exp || { echo "::error::KPN EXP did not produce a valid output file"; exit 1; }
-          ../../../..//kpn-exp/tools/kptools -l -i Image-kpn-exp
+          ../../../../../kpn-exp/tools/kptools -l -i Image-kpn-exp
           mv -f Image-kpn-exp Image
           echo "::notice::Kernel patched using KPatch-Next-EXP core $KPN_EXP_SHA"
 
