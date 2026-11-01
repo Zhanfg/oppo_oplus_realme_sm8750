@@ -930,6 +930,11 @@ jobs:
           cp kpn-exp/kernel/include/preset.h kpn-exp/tools/preset.h
           cmp -s kpn-exp/kernel/include/preset.h kpn-exp/tools/preset.h
           grep -Fq '#define EXTRA_ALIGN 0x10' kpn-exp/tools/preset.h
+          # Pinned EXP source includes the unused sha256.o in host Makefile,
+          # but has no tools/sha256.c. Fix this known build-only dependency.
+          test ! -f kpn-exp/tools/sha256.c
+          grep -Fxq 'objs += sha256.o' kpn-exp/tools/Makefile
+          sed -i '/^objs += sha256\.o$/d' kpn-exp/tools/Makefile
           make -C kpn-exp/tools -j2 CC=gcc
           test -x kpn-exp/tools/kptools
           echo "KPN EXP core: $KPN_EXP_SHA"
