@@ -441,7 +441,20 @@ jobs:
           ln -s ../../NoMount/kernel/src common/fs/nomount
           test -f common/fs/nomount/Kconfig && test -f common/fs/nomount/nomount.c || exit 1
           if ! grep -Fq 'source "fs/nomount/Kconfig"' common/fs/Kconfig; then
-            sed -i '/^endmenu$/i source "fs/nomount/Kconfig"' common/fs/Kconfig
+            # fs/Kconfig contains several nested endmenu entries. Insert only
+            # before the final endmenu, as the upstream NoMount setup does.
+            awk '
+              /^endmenu$/ { last = NR }
+              { lines[NR] = $0 }
+              END {
+                if (!last) exit 1
+                for (i = 1; i <= NR; ++i) {
+                  if (i == last) print "source \"fs/nomount/Kconfig\""
+                  print lines[i]
+                }
+              }
+            ' common/fs/Kconfig > common/fs/Kconfig.nomount
+            mv common/fs/Kconfig.nomount common/fs/Kconfig
           fi
           if ! grep -Fq 'obj-$(CONFIG_NOMOUNT) += nomount/' common/fs/Makefile; then
             printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> common/fs/Makefile
