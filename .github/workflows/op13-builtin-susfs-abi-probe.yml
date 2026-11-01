@@ -382,14 +382,13 @@ jobs:
           grep -Fq 'obj-$(CONFIG_NOMOUNT) += nomount/' common/fs/Makefile
           echo "::notice::NoMount v2.2.0, driver protocol v22, source $NOMOUNT_SHA integrated"
 
-      - name: Adapt SukiSU builtin Preinit translation unit (diagnostic only)
+      - name: Verify pinned SukiSU standalone Preinit source and runner ABI
         shell: bash
         run: |
           set -euo pipefail
           python3 tools/op13-fix-builtin-preinit.py
-          grep -Fq '#define runner_binary_len' kernel_workspace/KernelSU/kernel/preinit/preinit.c
-          grep -Fq '#include "preinit/preinit.c"' kernel_workspace/KernelSU/kernel/ksu_main.c
-          grep -Fq 'ksu-y += preinit/blob.o' kernel_workspace/KernelSU/kernel/Makefile
+          grep -Fq 'ksu-y += preinit/preinit.o preinit/blob.o' kernel_workspace/KernelSU/kernel/Makefile
+          grep -Fq '#include "nolibc.h"' kernel_workspace/KernelSU/kernel/preinit/runner/runner.c
 
       - name: 添加SUSFS 配置项
         if: true && 'sukisu' != 'none'
