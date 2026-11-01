@@ -33,8 +33,17 @@ echo "--- SUSFS kernel interface ---"
 "$KSUD" susfs status 2>&1 || echo "SUSFS probe unavailable; check compatibility of ksud, kernel and SUSFS variant"
 
 echo
-echo "NOTE: feature status 'enabled' reports a kernel-side flag, not proof that"
-echo "mount_hide hooks resolved on this device. Check boot dmesg for"
-echo "'mount_hide: enabled (3/3 files hooked)' or symbol/patch errors."
+echo "--- mount_hide hook initialization (read-only filtered kernel log) ---"
+if command -v dmesg >/dev/null 2>&1; then
+    dmesg 2>/dev/null |
+        grep 'mount_hide:' |
+        grep -E 'enabled \(3/3 files hooked\)|symbol lookup failed|show fns unresolved|ops unresolved|patch_text.*err' |
+        tail -n 12 || true
+else
+    echo "dmesg not available; check the device's kernel log manually."
+fi
+
+echo "NOTE: feature status 'enabled' is a flag, not proof that"
+echo "mount_hide hooks resolved and were installed successfully."
 echo "Soft reboot is a ksud/Manager operation; default module umount is an app"
 echo "profile setting, so neither is an independent kernel feature ID."
