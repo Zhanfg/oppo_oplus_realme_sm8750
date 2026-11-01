@@ -387,6 +387,7 @@ jobs:
               echo "::error::SUSFS UAF/RCU fix not found; refusing older source"
               exit 1
             fi
+            python3 "$GITHUB_WORKSPACE/tools/op13-audit-susfs-rcu.py" susfs4ksu/kernel_patches/fs/susfs.c
             # Do not apply legacy 69_hide_stuff.patch: it forges /proc maps
             # entries using hard-coded 'lineage' and 'jit-zygote-cache' names,
             # is unrelated to security hardening, and has partial-hunk hazards.
