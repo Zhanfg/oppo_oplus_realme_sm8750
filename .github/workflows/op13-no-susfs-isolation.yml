@@ -841,7 +841,10 @@ jobs:
             exit 1
           }
           test "$(grep -l '#include "preset.h"' kpn-exp/tools/{kptools,kallsym}.c | wc -l)" -eq 2
-          printf '/* No preset entries at this pinned KPN EXP commit. */\\n' > kpn-exp/tools/preset.h
+          # The sole missing macro is a buffer length alignment in extract_ikconfig().
+          # 16-byte power-of-two alignment is sufficient for this host buffer;
+          # no KPM or kernel security behavior is changed.
+          printf '%s\n' '/* Build compatibility for pinned EXP tool sources. */' '#define EXTRA_ALIGN 16' > kpn-exp/tools/preset.h
           make -C kpn-exp/tools -j2 CC=gcc
           test -x kpn-exp/tools/kptools
           echo "KPN EXP core: $KPN_EXP_SHA"
