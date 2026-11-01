@@ -199,8 +199,14 @@ jobs:
             # to SukiSU main (notably the recently added AVC manager feature).
             # This tests the missing hand-hook linkage without touching PR #1.
             echo "Probing SukiSU Ultra builtin branch SUSFS inline hooks..."
-            curl -fLSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/refs/heads/builtin/kernel/setup.sh" | bash -s builtin
+            curl -fLSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/464f9201116900280e18889b8165bd59d7c16311/kernel/setup.sh" | bash -s 464f9201116900280e18889b8165bd59d7c16311
             cd ./KernelSU
+            test "$(git rev-parse HEAD)" = "464f9201116900280e18889b8165bd59d7c16311" || {
+              echo "::error::SukiSU builtin ref drifted during checkout"; exit 1;
+            }
+            grep -Fq '#include "nolibc.h"' kernel/preinit/runner/runner.c || {
+              echo "::error::SukiSU builtin runner is not the pinned nolibc version"; exit 1;
+            }
             test -f kernel/Makefile && test -f kernel/ksu_main.c
             test -f kernel/feature/sucompat.c
             test -f kernel/supercall/dispatch.c
