@@ -1,0 +1,967 @@
+name: OP13 first kernel smoke build (ccache, no release)
+
+env:
+  TZ: Asia/Shanghai
+  ANDROID_VERSION: 'android15'
+  KERNEL_VERSION: '6.6'
+  SUB_VERSION: '118'
+  KERNEL_NAME: 'android15-8-g29d86c5fc9dd-abogki428889875-4k'
+  CCACHE_KEY: ccache-ecsv4-6.6.118
+
+on:
+  push:
+    branches:
+      - fix/op13-6.6.118-upstream-scheduler-20261101
+    paths:
+      - .github/workflows/op13-first-build-launcher.yml
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    outputs:
+      ksuver: ${{ steps.ksu_version.outputs.ksuver }}
+      ak3name: ${{ steps.create_zip.outputs.ak3name }}
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      # Checkout is required because the AK3 packaging step bundles
+      # tools/op13-sukisu-capabilities.sh from the workflow repository.
+      - name: Checkout AK3 workflow repository and diagnostic tools
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: 安装环境依赖+初始化源码仓库及llvm-Clang18工具链
+        run: |
+          rm -rf kernel_workspace
+          mkdir kernel_workspace
+          cd kernel_workspace
+          echo "当前仓库：$GITHUB_REPOSITORY"
+          echo "当前分支：$GITHUB_REF_NAME"
+          
+          sudo apt-mark hold firefox &&
+          sudo apt-mark hold libc-bin &&
+          sudo apt purge man-db &&
+          sudo rm -rf /var/lib/man-db/auto-update &&
+          sudo apt update &&
+          sudo apt-get install -y --no-install-recommends binutils python-is-python3 libssl-dev libelf-dev &
+          #旧版完整指令：（由于经过验证大部分指令已内置于GitHub Action环境中，故进行精简）
+          #sudo apt-get install -y --no-install-recommends curl bison flex make binutils git perl gcc python3 python-is-python3 bc libssl-dev libelf-dev zip unzip ccache
+          
+          #使用最新版ccache-ECS（特化优化内核编译缓存，大幅提升二次不同配置编译速度）
+          wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/lib/ccache-x86-64 -O ccache &&
+          sudo cp -f ./ccache /usr/bin/ccache &&
+          sudo chmod +x /usr/bin/ccache &&
+          rm -f ./ccache &
+          
+          echo "正在克隆源码仓库..."
+          aria2c -s16 -x16 -k1M https://github.com/cctv18/android_kernel_common_oneplus_sm8750/archive/refs/heads/oneplus/sm8750_b_16.0.0_oneplus_13_6.6.118.zip -o common.zip && 
+          unzip -q common.zip && 
+          mv "android_kernel_common_oneplus_sm8750-oneplus-sm8750_b_16.0.0_oneplus_13_6.6.118" common &&
+          rm -rf common.zip &
+          
+          echo "正在克隆llvm-clang18工具链..." &&
+          mkdir -p clang18 &&
+          aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang18-r510928/clang-r510928.zip -o clang.zip &&
+          unzip -q clang.zip -d clang18 &&
+          rm -rf clang.zip &
+          
+          echo "正在克隆构建工具..." &&
+          aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang18-r510928/build-tools.zip -o build-tools.zip &&
+          unzip -q build-tools.zip &&
+          rm -rf build-tools.zip &
+          
+          wait
+          echo "所有源码及llvm-Clang18工具链初始化完成！"
+          echo "正在去除 ABI 保护 & 去除 dirty 后缀..."
+          rm common/android/abi_gki_protected_exports_* || true
+          for f in common/scripts/setlocalversion; do
+            sed -i 's/ -dirty//g' "$f"
+            sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' "$f"
+          done
+
+      - name: 配置ccache目录
+        run: |
+          echo "CCACHE_DIR=$HOME/.ccache_${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }}" >> $GITHUB_ENV
+          echo "CCACHE_MAXSIZE=3G" >> $GITHUB_ENV
+          echo "当前磁盘空间："
+          df -h
+          echo "当前构建内核版本：${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }}"
+          if [[ "false" != "false" ]]; then
+            CCACHE_REAL_KEY=${{ env.CCACHE_KEY }}-Droidspaces
+          else
+            CCACHE_REAL_KEY=${{ env.CCACHE_KEY }}-none
+          fi
+          echo "CCACHE_REAL_KEY=$CCACHE_REAL_KEY" >> $GITHUB_ENV
+
+      - name: 载入当前版本内核的 ccache缓存
+        uses: actions/cache@v5
+        id: ccache-restore
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ env.CCACHE_REAL_KEY }}-${{ runner.os }}-${{ github.ref_name }}
+          restore-keys: |
+            ${{ env.CCACHE_REAL_KEY }}-${{ runner.os }}-
+            ${{ env.CCACHE_REAL_KEY }}-
+
+      - name: 拉取公共预置 ccache 缓存
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "检查本地缓存状态..."
+          if [ -d "${{ env.CCACHE_DIR }}" ] && [ "$(ls -A ${{ env.CCACHE_DIR }} 2>/dev/null)" ]; then
+            echo "检测到本地已成功载入 ccache 缓存，跳过公共 ccache 拉取！"
+            exit 0
+          fi
+          
+          echo "未命中缓存，尝试拉取最新公共 ccache ..."
+          mkdir -p ${{ env.CCACHE_DIR }}
+          if [[ "false" != "false" ]]; then
+            FILE_NAME="ccache-${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }}-Droidspaces.tar.zst"
+          else
+            FILE_NAME="ccache-${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }}.tar.zst"
+          fi
+          
+          if gh release download -p "$FILE_NAME" -R cctv18/public_ccache; then
+            echo "成功下载 $FILE_NAME，正在解压..."
+            tar -I zstd -xf "$FILE_NAME" -C ${{ env.CCACHE_DIR }}
+            echo "公共 ccache 恢复完成！"
+          else
+            echo "公共 ccache 中未找到对应的 ccache 文件，将进行全量全新编译..."
+          fi
+
+      - name: 清除旧 ccache 缓存
+        if: false
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "正在清除仓库中的旧 ccache 缓存..."
+          if gh cache delete ${{ env.CCACHE_REAL_KEY }}-${{ runner.os }}-${{ github.ref_name }} -R ${{ github.repository }}; then
+            echo "成功删除旧的 ccache 缓存！"
+          else
+            echo "旧缓存不存在或已被清理！"
+          fi
+      
+      - name: 初始化并配置ccache
+        run: |
+          # 设置ccache环境变量
+          export CCACHE_COMPILERCHECK="none"
+          export CCACHE_BASEDIR="${{ github.workspace }}"
+          export CCACHE_NOHASHDIR="true"
+          export CCACHE_NOHARDLINK="true"
+          export CCACHE_DIR="${{ env.CCACHE_DIR }}"
+          export CCACHE_MAXSIZE="${{ env.CCACHE_MAXSIZE }}"
+          
+          # 确保ccache目录存在
+          mkdir -p "$CCACHE_DIR"
+          
+          # 每次运行都重新配置缓存大小
+          echo "配置ccache缓存大小为: $CCACHE_MAXSIZE"
+          ccache -M "$CCACHE_MAXSIZE"
+          ccache -o compression=true
+          
+          # 显示初始缓存状态
+          echo "ccache初始状态:"
+          ccache -s
+          
+          # 如果缓存恢复命中，显示详细信息
+          if [ "${{ steps.ccache-restore.outputs.cache-hit }}" == 'true' ]; then
+            echo "ccache缓存命中详情:"
+            ccache -sv
+          fi
+
+      - name: 校验 KPM 实现互斥
+        run: |
+          if [[ "sukisu" == "sukisu" && "false" == "true" && "true" == "true" ]]; then
+            echo "::error::SukiSU built-in KPM and standalone KPatch Next must not be enabled simultaneously."
+            exit 1
+          fi
+
+      - name: 添加KernelSU
+        id: ksu_version
+        run: |
+          # 进入内核工作目录
+          cd kernel_workspace
+          if [[ sukisu == "bakasu" ]]; then
+            echo "正在配置 BakaSU main..."
+            curl -fLSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/refs/heads/main/kernel/setup.sh" | bash -s main
+            echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@cctv18"' >> ./common/arch/arm64/configs/gki_defconfig
+            cd ./KernelSU
+            KSU_VERSION=$(expr "$(git rev-list --count HEAD)" + 30700)
+            echo "KSUVER=$KSU_VERSION" >> "$GITHUB_ENV"
+            echo "ksuver=$KSU_VERSION" >> "$GITHUB_OUTPUT"
+          elif [[ sukisu == "sukisu" ]]; then
+            echo "正在配置官方 SukiSU Ultra main（不再重定向为 BakaSU）..."
+            curl -fLSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/refs/heads/main/kernel/setup.sh" | bash -s main
+            cd ./KernelSU
+            # Obtain version constants from SukiSU's Kbuild rather than inventing a BakaSU version.
+            VERSION_BASE=$(awk '/^VERSION_BASE[[:space:]]*:=/ {print $3; exit}' kernel/Kbuild)
+            VERSION_OFFSET=$(awk '/^VERSION_OFFSET[[:space:]]*:=/ {print $3; exit}' kernel/Kbuild)
+            [[ "$VERSION_BASE" =~ ^[0-9]+$ && "$VERSION_OFFSET" =~ ^[0-9]+$ ]] || { echo "::error::SukiSU version metadata missing"; exit 1; }
+            KSU_VERSION=$((VERSION_BASE + $(git rev-list --count HEAD) - VERSION_OFFSET))
+            echo "KSUVER=$KSU_VERSION" >> "$GITHUB_ENV"
+            echo "ksuver=$KSU_VERSION" >> "$GITHUB_OUTPUT"
+            for ext in extension/extension.c extension/kpm.c extension/cpu_spoof.c extension/umount_paths.c extension/dynamic_manager.c extension/susfs_extension.c extension/version_spoof.c; do
+              test -f "kernel/$ext" || { echo "::error::Missing SukiSU extension source: $ext"; exit 1; }
+            done
+            # The Manager settings screen uses the *feature* API, not the extension API.
+            for feature_src in feature/kernel_umount.c feature/mount_hide.c feature/selinux_hide.c feature/avc_spoof.c feature/sulog.c feature/adb_root.c feature/shell_su_adb_only.c policy/feature.c hook/setuid_hook.c hook/syscall_hook_manager.c; do
+              test -f "kernel/$feature_src" || { echo "::error::Missing SukiSU settings feature: $feature_src"; exit 1; }
+            done
+            grep -Fq 'ksu_mount_hide_init();' kernel/hook/setuid_hook.c || { echo "::error::SukiSU mount_hide initialization missing"; exit 1; }
+            grep -Fq 'ksu_setuid_hook_init();' kernel/hook/syscall_hook_manager.c || { echo "::error::SukiSU setuid mount-hide hook chain missing"; exit 1; }
+            grep -Fq 'feature/mount_hide.o' kernel/Kbuild || { echo "::error::SukiSU mount_hide implementation missing from kernel link"; exit 1; }
+            # Verify the six mount_hide targets exist in this OnePlus OKI source.
+            # Actual kallsyms resolution and hooks still require a post-boot probe.
+            for symbol in show_vfsmnt show_mountinfo show_vfsstat proc_mounts_operations proc_mountinfo_operations proc_mountstats_operations; do
+              grep -wq "$symbol" ../common/fs/proc_namespace.c || { echo "::error::OnePlus source missing mount_hide symbol: $symbol"; exit 1; }
+            done
+            for feature_name in kernel_umount mount_hide selinux_hide avc_spoof sulog adb_root shell_su_adb_only; do
+              grep -Fq "\"$feature_name\"" kernel/policy/feature.c || { echo "::error::Missing kernel feature ABI registration: $feature_name"; exit 1; }
+            done
+            # AVC is a feature (ID 10003), not a generic extension. Manager
+            # and ksud must use the same feature ABI; verify kernel-side pieces.
+            grep -Eq 'KSU_FEATURE_AVC_SPOOF[[:space:]]*=[[:space:]]*10003' uapi/feature.h || {
+              echo "::error::SukiSU AVC feature ID is incompatible with Manager/ksud"
+              exit 1
+            }
+            grep -Fq '.feature_id = KSU_FEATURE_AVC_SPOOF' kernel/feature/avc_spoof.c || {
+              echo "::error::AVC handler registration missing"
+              exit 1
+            }
+            grep -Fq 'slow_avc_audit' kernel/feature/avc_spoof.c || {
+              echo "::error::AVC audit hook target missing"
+              exit 1
+            }
+            grep -Fq 'ksu_avc_spoof_late_init();' kernel/core/init.c || {
+              echo "::error::AVC late init entry missing"
+              exit 1
+            }
+            echo "::notice::SukiSU feature/extension and AVC ABI checks passed."
+          elif [[ sukisu == "ksunext" ]]; then
+            echo "正在配置KernelSU Next..."
+            curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
+            cd KernelSU-Next
+            rm -rf .git
+            KSU_VERSION=$(expr $(curl -sI "https://api.github.com/repos/pershoot/KernelSU-Next/commits?sha=dev&per_page=1" | grep -i "link:" | sed -n 's/.*page=\([0-9]*\)>; rel="last".*/\1/p') "+" 30000)
+            echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
+            echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
+            sed -i "s/KSU_VERSION_FALLBACK := 1/KSU_VERSION_FALLBACK := $KSU_VERSION/g" kernel/Kbuild
+            KSU_GIT_TAG=$(curl -sL "https://api.github.com/repos/KernelSU-Next/KernelSU-Next/tags" | grep -o '"name": *"[^"]*"' | head -n 1 | sed 's/"name": "//;s/"//')
+            sed -i "s/KSU_VERSION_TAG_FALLBACK := v0.0.1/KSU_VERSION_TAG_FALLBACK := $KSU_GIT_TAG/g" kernel/Kbuild
+            #为KernelSU Next添加WildKSU管理器支持
+            cd ../common/drivers/kernelsu
+            wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/other_patch/apk_sign.patch
+            patch -p2 -N -F 3 < apk_sign.patch || true
+          elif [[ sukisu == "ksu" ]]; then
+            echo "正在配置原版 KernelSU (tiann/KernelSU)..."
+            curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/refs/heads/main/kernel/setup.sh" | bash -s main
+            cd ./KernelSU
+            KSU_VERSION=$(expr $(curl -sI "https://api.github.com/repos/tiann/KernelSU/commits?sha=main&per_page=1" | grep -i "link:" | sed -n 's/.*page=\([0-9]*\)>; rel="last".*/\1/p') "+" 30000)
+            echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
+            echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
+            sed -i "s/DKSU_VERSION=16/DKSU_VERSION=${KSU_VERSION}/" kernel/Kbuild
+          else
+            echo "已选择无内置KernelSU模式，跳过KernelSU配置..."
+          fi
+
+      - name: 应用 KernelSU & SUSFS 补丁
+        if: true && 'sukisu' != 'none'
+        run: |
+          cd kernel_workspace
+          if [[ sukisu != "none" ]]; then
+            echo "正在添加susfs补丁..."
+            git clone --depth=1 https://github.com/cctv18/susfs4oki.git susfs4ksu -b oki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
+            wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/other_patch/69_hide_stuff.patch -O ./common/69_hide_stuff.patch
+            cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch ./common/
+            cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
+            cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
+            # SukiSU Ultra main does not declare CONFIG_KSU_SUSFS: append
+            # upstream SUSFS Kconfig to its Kconfig so defconfig honors
+            # SUSFS instead of silently discarding every requested switch.
+            if [[ "sukisu" == "sukisu" ]]; then
+              cp "$GITHUB_WORKSPACE/tools/op13-susfs.Kconfig" ./common/fs/op13_susfs.Kconfig
+              grep -Fq 'source "fs/op13_susfs.Kconfig"' ./KernelSU/kernel/Kconfig ||
+                echo 'source "fs/op13_susfs.Kconfig"' >> ./KernelSU/kernel/Kconfig
+            fi
+            cd ./common
+            # OP13's task_mmu has only the braced smaps_rollup case-4 branch.
+            # The legacy patch also carries a non-braced alternate: drop only
+            # that inapplicable hunk, preserve the actual vendor case-4 fix.
+            python3 -c 'from pathlib import Path; src=Path("fs/proc/task_mmu.c").read_text(); p=Path("50_add_susfs_in_gki-android15-6.6.patch"); data=p.read_text(); first="@@ -999,8 +1056,15 @@ static int show_smaps_rollup"; second="@@ -1021,8 +1074,15 @@ static int show_smaps_rollup"; a=data.find(first); b=data.find(second); assert src.count("if (vma->vm_end > last_vma_end) {")==1, "Unknown OP13 layout"; assert a>=0 and b>a and data.count(first)==1 and data.count(second)==1, "Unknown SUSFS patch"; p.write_text(data[:a]+data[b:]); print("Removed only incompatible task_mmu hunk")'
+            patch --batch --dry-run --forward -p1 -F 3 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch
+            # Mandatory security patch: fail instead of producing an incomplete SUSFS build.
+            patch --batch --forward -p1 -F 3 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch
+            test -f fs/susfs.c && test -f include/linux/susfs.h || { echo "::error::SUSFS sources are missing"; exit 1; }
+            if ! patch --batch --forward -p1 -N -F 3 < 69_hide_stuff.patch; then
+              echo "::warning::69_hide_stuff.patch failed; please check kernel patch compatibility"
+            fi
+            cd ..
+          else
+            echo "已选择无内置KernelSU模式，跳过susfs配置..."
+          fi
+          if [[ sukisu == "ksu" ]]; then
+            echo "正在为原版 KernelSU (tiann/KernelSU)添加补丁..."
+            cp ./susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ./KernelSU/
+            cd ./KernelSU
+            patch -p1 -F 3 < 10_enable_susfs_for_ksu.patch || true
+          fi
+          
+      - name: 应用lz4 1.10.0 & zstd 1.5.7补丁
+        if: true
+        run: |
+          echo "正在添加lz4 1.10.0 & zstd 1.5.7补丁…"
+          cd kernel_workspace
+          git clone --depth=1 https://github.com/$GITHUB_REPOSITORY.git -b $GITHUB_REF_NAME $GITHUB_ACTOR
+          cp ./$GITHUB_ACTOR/zram_patch/001-lz4.patch ./common/
+          cp ./$GITHUB_ACTOR/zram_patch/lz4armv8.S ./common/lib
+          cp ./$GITHUB_ACTOR/zram_patch/002-zstd.patch ./common/
+          cd ./common
+          git apply -p1 < 001-lz4.patch || true
+          patch -p1 -F 3 < 002-zstd.patch || true
+
+      - name: 应用 lz4kd 补丁
+        if: false
+        run: |
+          echo "正在添加lz4kd补丁…"
+          cd kernel_workspace
+          if [ ! -d "SukiSU_patch" ]; then
+            git clone --depth=1 https://github.com/ShirkNeko/SukiSU_patch.git
+          fi
+          cd common
+          cp -r ../SukiSU_patch/other/zram/lz4k/include/linux/* ./include/linux/
+          cp -r ../SukiSU_patch/other/zram/lz4k/lib/* ./lib
+          cp -r ../SukiSU_patch/other/zram/lz4k/crypto/* ./crypto
+          cp ../SukiSU_patch/other/zram/zram_patch/${{ env.KERNEL_VERSION }}/lz4kd.patch ./
+          patch -p1 -F 3 < lz4kd.patch || true
+          
+      - name: 集成 NoMount v2.2.0 内核 VFS 驱动
+        if: true
+        env:
+          NOMOUNT_VERSION: v2.2.0
+          NOMOUNT_SHA: bf1847f98fed382369c43bfd652cd93774b9b8e3
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd kernel_workspace
+          # Use the immutable public release, not moving dev/master branches.
+          git clone --depth 1 --branch "$NOMOUNT_VERSION" \
+            https://github.com/maxsteeel/nomount.git NoMount
+          test "$(git -C NoMount rev-parse HEAD)" = "$NOMOUNT_SHA" || {
+            echo "::error::NoMount source does not match audited v2.2.0 SHA"
+            exit 1
+          }
+          grep -Fq '#define NOMOUNT_BASE_VERSION "22"' NoMount/kernel/src/nomount.h || {
+            echo "::error::NoMount protocol is not v22"
+            exit 1
+          }
+          test ! -e common/fs/nomount && test ! -L common/fs/nomount || {
+            echo "::error::fs/nomount already exists: cannot silently mix VFS implementations"
+            exit 1
+          }
+          ln -s ../../NoMount/kernel/src common/fs/nomount
+          test -f common/fs/nomount/Kconfig && test -f common/fs/nomount/nomount.c || exit 1
+          if ! grep -Fq 'source "fs/nomount/Kconfig"' common/fs/Kconfig; then
+            # fs/Kconfig contains several nested endmenu entries. Insert only
+            # before the final endmenu, as the upstream NoMount setup does.
+            awk '
+              /^endmenu$/ { last = NR }
+              { lines[NR] = $0 }
+              END {
+                if (!last) exit 1
+                for (i = 1; i <= NR; ++i) {
+                  if (i == last) print "source \"fs/nomount/Kconfig\""
+                  print lines[i]
+                }
+              }
+            ' common/fs/Kconfig > common/fs/Kconfig.nomount
+            mv common/fs/Kconfig.nomount common/fs/Kconfig
+          fi
+          if ! grep -Fq 'obj-$(CONFIG_NOMOUNT) += nomount/' common/fs/Makefile; then
+            printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> common/fs/Makefile
+          fi
+          grep -Fq 'source "fs/nomount/Kconfig"' common/fs/Kconfig
+          grep -Fq 'obj-$(CONFIG_NOMOUNT) += nomount/' common/fs/Makefile
+          echo "::notice::NoMount v2.2.0, driver protocol v22, source $NOMOUNT_SHA integrated"
+
+      - name: 添加SUSFS 配置项
+        if: true && 'sukisu' != 'none'
+        run: |
+          cd kernel_workspace
+          echo "CONFIG_KSU_SUSFS=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> ./common/arch/arm64/configs/gki_defconfig
+          
+      - name: 添加 KSU & 其他配置项
+        run: |
+          cd kernel_workspace
+          if [[ "sukisu" == "none" ]]; then
+            echo "# CONFIG_KSU is not set" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "# CONFIG_KSU_SUSFS is not set" >> ./common/arch/arm64/configs/gki_defconfig
+          else
+            echo "CONFIG_KSU=y" >> ./common/arch/arm64/configs/gki_defconfig
+            if [[ "true" == "false" ]]; then
+              echo "# CONFIG_KSU_SUSFS is not set" >> ./common/arch/arm64/configs/gki_defconfig
+            fi
+          fi
+          # NoMount is independent of SUSFS and EXP KPM. It requires the
+          # Linux keyring subsystem used by the userspace nm v22 protocol.
+          if [[ "true" == "true" ]]; then
+            echo "CONFIG_KEYS=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_NOMOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          else
+            echo "# CONFIG_NOMOUNT is not set" >> ./common/arch/arm64/configs/gki_defconfig
+          fi
+          #添加对 Mountify (backslashxx/mountify) 模块的支持
+          echo "CONFIG_TMPFS_XATTR=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_TMPFS_POSIX_ACL=y" >> ./common/arch/arm64/configs/gki_defconfig
+          if [[ "false" == "true" ]]; then
+            echo "CONFIG_ZSMALLOC=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_CRYPTO_LZ4HC=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_CRYPTO_LZ4K=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_CRYPTO_LZ4KD=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_CRYPTO_842=y" >> ./common/arch/arm64/configs/gki_defconfig
+          fi
+          # SukiSU bundles CPU spoof, Umount paths, dynamic manager, SUSFS and
+          # version spoof extensions in its kernel/Kbuild. KPM needs CONFIG_KPM.
+          if [[ "sukisu" == "sukisu" ]]; then
+            # Required by SukiSU syscall hooks, mount_hide symbol resolution,
+            # AVC spoofing and per-app policy / default module unmount.
+            echo "CONFIG_KPROBES=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_KALLSYMS=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_KALLSYMS_ALL=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "# CONFIG_KSU_DISABLE_MANAGER is not set" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "# CONFIG_KSU_DISABLE_POLICY is not set" >> ./common/arch/arm64/configs/gki_defconfig
+            if [[ "false" == "true" ]]; then
+              echo "CONFIG_KPM=y" >> ./common/arch/arm64/configs/gki_defconfig
+              echo "CONFIG_KALLSYMS=y" >> ./common/arch/arm64/configs/gki_defconfig
+              echo "CONFIG_KALLSYMS_ALL=y" >> ./common/arch/arm64/configs/gki_defconfig
+            else
+              echo "# CONFIG_KPM is not set" >> ./common/arch/arm64/configs/gki_defconfig
+            fi
+          else
+            echo "# CONFIG_KPM is not set" >> ./common/arch/arm64/configs/gki_defconfig
+          fi
+          # Explicitly retain the arm64 Spectre-BHB mitigation.
+          echo "CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY=y" >> ./common/arch/arm64/configs/gki_defconfig
+          # 开启O2编译优化配置
+          echo "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y" >> ./common/arch/arm64/configs/gki_defconfig
+          #禁用 defconfig 检查
+          sed -i 's/check_defconfig//' ./common/build.config.gki
+          # SukiSU Ultra's embedded preinit runner is built against
+          # out/usr/include/linux/unistd.h. The old blanket disabling of
+          # CONFIG_HEADERS_INSTALL silently removed that build path.
+          if [[ "sukisu" == "sukisu" ]]; then
+            echo "CONFIG_HEADERS_INSTALL=y" >> ./common/arch/arm64/configs/gki_defconfig
+          else
+            echo "# CONFIG_HEADERS_INSTALL is not set" >> ./common/arch/arm64/configs/gki_defconfig
+          fi
+          # 应用 CVE_2026_43499 修复补丁
+          cd common
+          wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/other_patch/cve-2026-43499-rtmutex-6.6.patch
+          patch -p1 -F 3 < cve-2026-43499-rtmutex-6.6.patch
+          
+      - name: 启用网络功能增强优化配置
+        if: false
+        run: |
+          cd kernel_workspace
+          #启用  BPF 流解析器,实现高性能网络流量处理,增强网络监控和分析能力
+          echo "CONFIG_BPF_STREAM_PARSER=y" >> ./common/arch/arm64/configs/gki_defconfig
+          #开启增强 Netfilter 防火墙扩展模块,支持基于地址类型的匹配规则,启用 IP 集合支持,提高防火墙规则灵活性,支持更复杂的流量过滤策略
+          echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_NETFILTER_XT_SET=y" >> ./common/arch/arm64/configs/gki_defconfig
+          #启用 IP 集框架及其多种数据结构实现,提供高效的大规模 IP 地址管理,提高防火墙规则处理效率,减少内存占用
+          echo "CONFIG_IP_SET=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_MAX=65534" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_BITMAP_IP=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_BITMAP_IPMAC=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_BITMAP_PORT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_HASH_IP=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_HASH_IPMARK=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_HASH_IPPORT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_HASH_IPPORTIP=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_HASH_IPPORTNET=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_HASH_IPMAC=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_HASH_MAC=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_HASH_NETPORTNET=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_HASH_NET=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_HASH_NETNET=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_HASH_NETPORT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_HASH_NETIFACE=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_LIST_SET=y" >> ./common/arch/arm64/configs/gki_defconfig
+          #启用 IPv6 网络地址转换
+          echo "CONFIG_IP6_NF_NAT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP6_NF_TARGET_MASQUERADE=y" >> ./common/arch/arm64/configs/gki_defconfig
+          #由于部分机型的vintf兼容性检测规则，在开启CONFIG_IP6_NF_NAT后开机会出现"您的设备内部出现了问题。请联系您的设备制造商了解详情。"的提示，故添加一个配置修复补丁，在编译内核时隐藏CONFIG_IP6_NF_NAT=y但不影响对应功能编译
+          cd common
+          wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/other_patch/config.patch
+          patch -p1 -F 3 < config.patch || true
+
+      - name: 添加 BBR 等一系列拥塞控制算法
+        run: |
+          if [[ "false" != "false" ]]; then
+            echo "正在添加BBR等拥塞控制算法..."
+            cd kernel_workspace
+            #开启TCP拥塞控制算法控制器（必需）
+            echo "CONFIG_TCP_CONG_ADVANCED=y" >> ./common/arch/arm64/configs/gki_defconfig
+            ################################################################################################################################
+            # BBR：基于链路容量的代表拥塞控制算法，不再使用丢包、延时等信号去衡量拥塞是否发生，而是直接对网络建模来应对、避免真实的网络拥塞；
+            # 具有高吞吐、低延迟、抗丢包的特点，但在手机上使用时由于持续探测带宽/RTT、高频计算与发包增加 CPU 和射频模块功耗，会增加耗电及发热；
+            # 且移动基站缓冲区深度通常较小（~50ms），BBR 的带宽探测阶段（ProbeRTT）过度降窗可能导致吞吐量骤降，且网络切换（WiFi→5G）时需重新
+            # 探测参数，反而增加延迟或导致速率振荡（短暂卡顿），且存在 RTT 不公平性，与基于丢包的流竞争时可能过于强势，在混合网络环境中
+            #（如 BBR + CUBIC 共存），BBR 会抢占更多其他软件的带宽，降低其他应用的公平性（如后台软件更新影响前台视频播放）。
+            # 因此，虽然BBR可以显著减少排队延迟，抗丢包能力强，带宽利用率高，但由于其会增加耗电，且易导致网络速率波动，故安卓系统默认不使用
+            # BBR拥塞算法，而是使用在吞吐量、稳定性、兼容性、能效之间取得最佳平衡的CUBIC算法。在开启BBR前，请考虑自己是否真的有使用BBR的必要。
+            ################################################################################################################################
+            echo "CONFIG_TCP_CONG_BBR=y" >> ./common/arch/arm64/configs/gki_defconfig
+            #CUBIC：安卓的默认TCP拥塞控制算法，在吞吐量、稳定性、兼容性、能效之间取得最佳平衡，具有高兼容性与公平性、抗网络波动性强、低计算开销的特点，是绝大部分移动场景的优先选择
+            echo "CONFIG_TCP_CONG_CUBIC=y" >> ./common/arch/arm64/configs/gki_defconfig
+            #VEGAS：基于时延的拥塞控制算法之一，将回路响应时间（Round Trip Time，RTT）增加视为出现拥塞，增加时增大拥塞窗口，减小时减小拥塞窗口
+            echo "CONFIG_TCP_CONG_VEGAS=y" >> ./common/arch/arm64/configs/gki_defconfig
+            #New Vegas：Vegas 算法的改进版，优化了 RTT 测量和竞争公平性，可以更准确地检测拥塞，与 Reno/CUBIC 共存能力提升
+            echo "CONFIG_TCP_CONG_NV=y" >> ./common/arch/arm64/configs/gki_defconfig
+            #Westwood+：基于带宽估计（ACK 到达率）动态设置拥塞窗口和慢启动阈值；快速恢复，适合无线网络（区分拥塞丢包与无线丢包）
+            echo "CONFIG_TCP_CONG_WESTWOOD=y" >> ./common/arch/arm64/configs/gki_defconfig
+            #HTCP：一种基于损失的算法，使用 AIMD 来控制拥塞窗口，根据 RTT 动态调整增长因子，结合延迟和丢包信号，针对高延迟的高速网络进行优化
+            echo "CONFIG_TCP_CONG_HTCP=y" >> ./common/arch/arm64/configs/gki_defconfig
+            #brutal：一种通过主动探测 + 激进抢占最大化吞吐量的拥塞算法，无拥塞窗口上限，轻度丢包（<20%）不降窗，避免类似 BBR 的 ProbeRTT 阶段，
+            #持续维持高发送速率，与 Reno/CUBIC 共存时，Brutal 可通过高频发包抢占 90%+ 带宽，适用于高丢包弱网环境（如公共 Wi-Fi、蜂窝网络）及
+            #直播推流、云游戏上行链路等需优先保证吞吐量而非延迟敏感的场景，提升弱网吞吐性能，对抗运营商 QoS 限速。但由于TCP Brutal 仅在应用程序
+            #对每个 TCP 连接设置带宽参数之后才能正常工作，绝大部分安卓应用都不支持该操作，故请勿将 TCP Brutal 设置成默认拥塞控制算法。
+            echo "CONFIG_TCP_CONG_BRUTAL=y" >> ./common/arch/arm64/configs/gki_defconfig
+            if [[ "false" == "default" ]]; then
+              echo "正在将BBR设为默认拥塞控制算法..."
+              echo "CONFIG_DEFAULT_TCP_CONG=bbr" >> ./common/arch/arm64/configs/gki_defconfig
+            else
+              echo "CONFIG_DEFAULT_TCP_CONG=cubic" >> ./common/arch/arm64/configs/gki_defconfig
+            fi
+          fi
+
+      - name: 启用 Droidspaces 容器支持
+        run: |
+          if [[ "false" != "false" ]]; then
+            echo "正在启用 Droidspaces 容器支持..."
+            cd kernel_workspace/common
+            # 应用 Droidspaces 容器必须补丁
+            wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/droidspaces_patch/fix_sysvipc_kabi_6_7_8.patch
+            patch -p1 -F 3 < fix_sysvipc_kabi_6_7_8.patch || true
+            # 修补 oplus_bsp_midas 行为，避免开机崩溃
+            wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/droidspaces_patch/fix_oplus_bsp_midas.patch
+            patch -p1 -F 3 < fix_oplus_bsp_midas.patch || true
+            # 应用 NTSync 补丁
+            wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/droidspaces_patch/ntsync_base.patch
+            wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/droidspaces_patch/ntsync_compat_${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch
+            patch -p1 -F 3 < ntsync_base.patch || true
+            patch -p1 -F 3 < ntsync_compat_${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || true
+            # 开启 Droidspaces 容器所需内核支持
+            echo "CONFIG_PID_NS=y" >> ./arch/arm64/configs/gki_defconfig
+            echo "CONFIG_IPC_NS=y" >> ./arch/arm64/configs/gki_defconfig
+            echo "CONFIG_USER_NS=y" >> ./arch/arm64/configs/gki_defconfig
+            echo "CONFIG_SYSVIPC=y" >> ./arch/arm64/configs/gki_defconfig
+            echo "CONFIG_DEVTMPFS=y" >> ./arch/arm64/configs/gki_defconfig
+            echo "CONFIG_NAMESPACES=y" >> ./arch/arm64/configs/gki_defconfig
+            echo "CONFIG_POSIX_MQUEUE=y" >> ./arch/arm64/configs/gki_defconfig
+            echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y" >> ./arch/arm64/configs/gki_defconfig
+            echo "CONFIG_NETFILTER_XT_TARGET_LOG=y" >> ./arch/arm64/configs/gki_defconfig
+            echo "CONFIG_NETFILTER_XT_MATCH_RECENT=y" >> ./arch/arm64/configs/gki_defconfig
+            # 未经测试的配置选项，可能导致bug
+            #echo "CONFIG_CGROUP_DEVICE=y" >> ./arch/arm64/configs/gki_defconfig
+            #echo "CONFIG_CGROUP_PIDS=y" >> ./arch/arm64/configs/gki_defconfig
+            #echo "CONFIG_FW_LOADER_COMPRESS=y" >> ./arch/arm64/configs/gki_defconfig
+            #echo "CONFIG_BRIDGE_NETFILTER=y" >> ./arch/arm64/configs/gki_defconfig
+            #echo "CONFIG_NF_TABLES=y" >> ./arch/arm64/configs/gki_defconfig
+            # 开启 NTSync
+            echo "CONFIG_NTSYNC=y" >> ./arch/arm64/configs/gki_defconfig
+            if [[ "false" == "extend" ]]; then
+              echo "正在启用容器环境扩展支持..."
+              # 开启虚拟 HCI 设备支持
+              echo "CONFIG_BT_HCIVHCI=y" >> ./arch/arm64/configs/gki_defconfig
+              # 开启 systemd-coredump 支持
+              echo "CONFIG_STATIC_USERMODEHELPER=n" >> ./arch/arm64/configs/gki_defconfig
+              # 添加 Lindroid EVDI DRM 驱动
+              wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/droidspaces_patch/evdi_drm.patch
+              patch -p1 -F 3 < evdi_drm.patch || true
+              echo "CONFIG_DRM_LINDROID_EVDI=y" >> ./arch/arm64/configs/gki_defconfig
+            fi
+          fi
+
+      - name: 启用ADIOS IO调度器
+        if: true
+        run: |
+          echo "正在启用ADIOS IO调度器(将截止时间优先调度算法与基于自主学习的自适应延迟控制算法相结合, 降低I/O延迟)…"
+          cd kernel_workspace
+          echo "CONFIG_MQ_IOSCHED_ADIOS=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_MQ_IOSCHED_DEFAULT_ADIOS=y" >> ./common/arch/arm64/configs/gki_defconfig
+
+      - name: 启用Re-Kernel支持
+        if: false
+        run: |
+          echo "正在启用Re-Kernel支持(用于与Freezer,NoActive等软件配合使用,提升冻结后台能力)…"
+          cd kernel_workspace
+          echo "CONFIG_REKERNEL=y" >> ./common/arch/arm64/configs/gki_defconfig
+
+      - name: 启用内核级基带保护
+        if: true
+        run: |
+          echo "正在启用启用内核级基带保护支持…"
+          cd kernel_workspace
+          echo "CONFIG_BBG=y" >> ./common/arch/arm64/configs/gki_defconfig
+          cd ./common
+          curl -fLSs https://raw.githubusercontent.com/vc-teahouse/Baseband-guard/main/setup.sh | bash
+          sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
+
+      - name: 添加制作名称
+        run: |
+          cd kernel_workspace
+          echo "替换内核版本后缀..."
+          if [[ -n "op13-exp-smoke1" ]]; then
+            echo "当前内核版本后缀：op13-exp-smoke1"
+            for f in ./common/scripts/setlocalversion; do
+              sed -i "\$s|echo \"\\\$res\"|echo \"-op13-exp-smoke1\"|" "$f"
+            done
+            sudo sed -i 's/-4k/-op13-exp-smoke1/g' ./common/arch/arm64/configs/gki_defconfig
+          else
+            echo "当前内核版本后缀：${{ env.KERNEL_NAME }}"
+            for f in ./common/scripts/setlocalversion; do
+              sed -i "\$s|echo \"\\\$res\"|echo \"-${{ env.KERNEL_NAME }}\"|" "$f"
+            done
+            sudo sed -i 's/-4k/-${{ env.KERNEL_NAME }}/g' ./common/arch/arm64/configs/gki_defconfig
+          fi
+          sed -i 's/${scm_version}//' ./common/scripts/setlocalversion
+          echo "CONFIG_LOCALVERSION_AUTO=n" >> ./common/arch/arm64/configs/gki_defconfig
+           
+      - name: 构建内核
+        run: |
+          WORKDIR="$(pwd)"
+          export PATH="/usr/lib/ccache:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/clang18/bin:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
+          CLANG_DIR="$WORKDIR/kernel_workspace/clang18/bin"
+          CLANG_VERSION="$($CLANG_DIR/clang --version | head -n 1)"
+          LLD_VERSION="$($CLANG_DIR/ld.lld --version | head -n 1)"
+          echo "编译器信息:"
+          echo "Clang版本: $CLANG_VERSION"
+          echo "LLD版本: $LLD_VERSION"
+          pahole_version=$(pahole --version 2>/dev/null | head -n1); [ -z "$pahole_version" ] && echo "pahole版本：未安装" || echo "pahole版本：$pahole_version"
+          
+          export CCACHE_LOGFILE="${{ github.workspace }}/kernel_workspace/ccache.log"
+          export CCACHE_COMPILERCHECK="none"
+          export CCACHE_BASEDIR="${{ github.workspace }}"
+          export CCACHE_NOHASHDIR="true"
+          export CCACHE_NOHARDLINK="true"
+          export CCACHE_DIR="${{ env.CCACHE_DIR }}"
+          export CCACHE_MAXSIZE="3G"
+          export CCACHE_IS_KERNEL_COMPILING="true"
+          echo "sloppiness = file_stat_matches,include_file_ctime,include_file_mtime,pch_defines,file_macro,time_macros" >> "$CCACHE_DIR/ccache.conf"
+          
+          cd kernel_workspace/common
+          wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/lib/libfakestat.so
+          wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/lib/libfaketimeMT.so
+          chmod 777 ./*.so
+          export FAKESTAT="2025-05-25 12:00:00"
+          export FAKETIME="@2025-05-25 13:00:00"
+          echo "FAKESTAT=$FAKESTAT" >> $GITHUB_ENV
+          echo "FAKETIME=$FAKETIME" >> $GITHUB_ENV
+          SO_DIR=$(pwd)
+          export PRELOAD_LIBS="$SO_DIR/libfakestat.so $SO_DIR/libfaketimeMT.so"
+          #创建 CC (编译器) 包装器
+          echo '#!/bin/bash' > cc-wrapper
+          echo 'export LD_PRELOAD="'$PRELOAD_LIBS'"' >> cc-wrapper
+          echo 'export FAKESTAT="'$FAKESTAT'"' >> cc-wrapper
+          echo 'export FAKETIME="'$FAKETIME'"' >> cc-wrapper
+          echo 'ccache clang "$@"' >> cc-wrapper
+          #创建 LD (链接器) 包装器
+          echo '#!/bin/bash' > ld-wrapper
+          echo 'export LD_PRELOAD="'$PRELOAD_LIBS'"' >> ld-wrapper
+          echo 'export FAKESTAT="'$FAKESTAT'"' >> ld-wrapper
+          echo 'export FAKETIME="'$FAKETIME'"' >> ld-wrapper
+          echo 'ld.lld "$@"' >> ld-wrapper
+          
+          # 测试时间劫持测试是否正常工作
+          echo "--- [Wrapper Test] 正在创建通用的时间劫持测试脚本 ---"
+          echo '#!/bin/bash' > test-wrapper.sh
+          echo 'export LD_PRELOAD="'$PRELOAD_LIBS'"' >> test-wrapper.sh
+          echo 'export FAKESTAT="'$FAKESTAT'"' >> test-wrapper.sh
+          echo 'export FAKETIME="'$FAKETIME'"' >> test-wrapper.sh
+          echo 'echo ">>> Wrapper 内部环境检查完毕."' >> test-wrapper.sh
+          echo 'exec "$@"' >> test-wrapper.sh # 执行所有传入的参数
+          chmod +x test-wrapper.sh
+          echo "--- [Wrapper Test] 正在测试 (date) 命令 ---"
+          ./test-wrapper.sh date
+          echo "--- [Wrapper Test] 正在测试 (stat) 命令 ---"
+          ./test-wrapper.sh stat ./Makefile
+          echo "--- [Wrapper Test] 测试完毕 ---"
+          chmod +x cc-wrapper ld-wrapper
+          echo "--- 编译前环境时间: $(LD_PRELOAD=$PRELOAD_LIBS date) ---"
+          echo "--- 编译前环境文件时间戳: ---"
+          LD_PRELOAD=$PRELOAD_LIBS stat ./Makefile
+          
+          #在构建内核的同时清除不必要的.NET, Android NDK, Haskell, CodeQL运行库，清理空间且不阻塞后续步骤运行
+          sudo rm -rf /usr/share/dotnet &
+          sudo rm -rf /usr/local/lib/android &
+          sudo rm -rf /opt/ghc &
+          sudo rm -rf /opt/hostedtoolcache/CodeQL &
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error gki_defconfig &&
+          if [[ "sukisu" == "sukisu" ]]; then
+            # Populate the UAPI headers required for SukiSU embedded preinit.
+            make -j$(nproc --all) LLVM=1 ARCH=arm64 O=out headers_install
+            test -f out/usr/include/linux/unistd.h || {
+              echo "::error::SukiSU preinit UAPI headers unavailable; refusing a silently reduced build"
+              exit 1
+            }
+          fi
+          # Official OPlus HMBIRD scheduler must remain enabled in this OKI build.
+          grep -q '^CONFIG_HMBIRD_SCHED=y$' out/.config || { echo "::error::HMBIRD/Fengchi disabled in final kernel config"; exit 1; }
+          if [[ "true" == "true" ]]; then
+            grep -qx 'CONFIG_KEYS=y' out/.config || { echo "::error::Linux Keyring disabled; NoMount cannot work"; exit 1; }
+            grep -qx 'CONFIG_NOMOUNT=y' out/.config || { echo "::error::NoMount not enabled in final kernel config"; exit 1; }
+            test -f fs/nomount/nomount.c || { echo "::error::NoMount VFS driver missing from kernel build tree"; exit 1; }
+            grep -Fq '#define NOMOUNT_BASE_VERSION "22"' fs/nomount/nomount.h || { echo "::error::NoMount protocol mismatched"; exit 1; }
+          fi
+          # Fail the build if critical Spectre, BPF or memory-hardening protections regress.
+          # This is a build-time regression gate, not a guarantee of runtime CPU mitigation.
+          for security_config in \
+            CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY \
+            CONFIG_ARM64_SW_TTBR0_PAN \
+            CONFIG_BPF_JIT_ALWAYS_ON \
+            CONFIG_RANDOMIZE_BASE \
+            CONFIG_SHADOW_CALL_STACK \
+            CONFIG_CFI_CLANG \
+            CONFIG_HARDENED_USERCOPY; do
+            grep -qx "${security_config}=y" out/.config || {
+              echo "::error::Security regression: ${security_config} is not enabled"
+              exit 1
+            }
+          done
+          grep -q 'static bool is_spectre_bhb_safe' arch/arm64/kernel/proton-pack.c &&
+          grep -q 'if (is_spectre_bhb_safe(scope))' arch/arm64/kernel/proton-pack.c &&
+          grep -q 'supports_clearbhb' arch/arm64/kernel/proton-pack.c || {
+            echo "::error::Spectre-BHB CPU detection or mitigation source is missing"
+            exit 1
+          }
+          grep -q 'sanitize_speculative_path' kernel/bpf/verifier.c || {
+            echo "::error::eBPF verifier Spectre-v1 speculative sanitizer is missing"
+            exit 1
+          }
+          echo "::notice::Spectre-BHB and eBPF baseline verified; runtime mitigation must be checked on-device."
+          if [[ "sukisu" == "sukisu" ]]; then
+            grep -q '^CONFIG_KSU=y$' out/.config || { echo "::error::SukiSU kernel not enabled"; exit 1; }
+            for feature_config in CONFIG_KPROBES CONFIG_KALLSYMS CONFIG_KALLSYMS_ALL CONFIG_EXT4_FS; do
+              grep -qx "${feature_config}=y" out/.config || { echo "::error::SukiSU feature prerequisite missing: ${feature_config}"; exit 1; }
+            done
+            if grep -q '^CONFIG_KSU_DISABLE_POLICY=y$' out/.config; then
+              echo "::error::SukiSU per-app module unmount policy disabled"
+              exit 1
+            fi
+            if [[ "false" == "true" ]]; then
+              grep -q '^CONFIG_KPM=y$' out/.config || { echo "::error::SukiSU KPM missing from kernel config"; exit 1; }
+            fi
+            if [[ "true" == "true" ]]; then
+              grep -q '^CONFIG_KSU_SUSFS=y$' out/.config || { echo "::error::SUSFS missing from kernel config"; exit 1; }
+            fi
+            if grep -q '^CONFIG_KSU_DISABLE_MANAGER=y$' out/.config; then
+              echo "::error::SukiSU dynamic manager disabled in kernel config"
+              exit 1
+            fi
+          fi
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error Image
+          
+          # 编译后时间劫持二次校验
+          echo "--- 编译后环境时间: $(LD_PRELOAD=$PRELOAD_LIBS date) ---"
+          echo "--- 编译后环境文件时间戳: ---"
+          LD_PRELOAD=$PRELOAD_LIBS stat ./Makefile
+          echo "内核编译完成！"
+          echo "ccache状态："
+          ccache -s
+          echo "编译后空间:"
+          df -h
+
+      - name: 保存新的 ccache 缓存
+        if: false || steps.ccache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ env.CCACHE_REAL_KEY }}-${{ runner.os }}-${{ github.ref_name }}
+         
+      - name: 使用 KPatch-Next-EXP 固定核心编译 kpimg / kptools 并修补 Image
+        if: true
+        env:
+          KPN_EXP_SHA: 8193f610d0105569437e17cc991459365dfa463a
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Keep the same EXP core SHA used by the successful v0.0.9 Nohello
+          # module CI, not KernelSU-Next/KPatch-Next latest release.
+          [[ "false" != "true" || "sukisu" != "sukisu" ]] || {
+            echo "::error::External KPN EXP and SukiSU internal KPM must not coexist."
+            exit 1
+          }
+          sudo apt-get install -y --no-install-recommends curl xz-utils zlib1g-dev
+          cd kernel_workspace
+          git init -q kpn-exp
+          git -C kpn-exp remote add origin https://github.com/Zhanfg/KPatch-Next-EXP.git
+          git -C kpn-exp fetch --depth 1 origin "$KPN_EXP_SHA"
+          git -C kpn-exp checkout --detach FETCH_HEAD
+          [[ "$(git -C kpn-exp rev-parse HEAD)" == "$KPN_EXP_SHA" ]] || {
+            echo "::error::Pinned KPN EXP commit mismatch"
+            exit 1
+          }
+          curl -fL --retry 3 -o kpn-exp-toolchain.tar.xz \
+            https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu/12.2.rel1/binrel/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
+          mkdir -p kpn-exp-toolchain
+          tar -xJf kpn-exp-toolchain.tar.xz -C kpn-exp-toolchain --strip-components=1
+          rm -f kpn-exp-toolchain.tar.xz
+          CROSS="$(pwd)/kpn-exp-toolchain/bin/aarch64-none-elf-"
+          make -C kpn-exp/kernel -j2 TARGET_COMPILE="$CROSS" kpimg
+          test -s kpn-exp/kernel/kpimg
+          "${CROSS}nm" -a kpn-exp/kernel/kpimg.elf > kpn-exp/symbols.txt
+          grep -Fq '__kp_symbol_is_su_allow_uid' kpn-exp/symbols.txt || {
+            echo "::error::EXP kpimg missing the Nohello compatibility symbol"
+            exit 1
+          }
+          # kptools shares the kpimg ABI declared in kernel/include/preset.h.
+          # Copy the exact same-revision header; never fabricate ABI structs.
+          test -s kpn-exp/kernel/include/preset.h
+          test ! -e kpn-exp/tools/preset.h
+          cp kpn-exp/kernel/include/preset.h kpn-exp/tools/preset.h
+          cmp -s kpn-exp/kernel/include/preset.h kpn-exp/tools/preset.h
+          grep -Fq '#define EXTRA_ALIGN 0x10' kpn-exp/tools/preset.h
+          # Pinned KPN EXP Makefile incorrectly lists an absent unused object.
+          test ! -f kpn-exp/tools/sha256.c
+          grep -Fxq 'objs += sha256.o' kpn-exp/tools/Makefile
+          sed -i '/^objs += sha256\.o$/d' kpn-exp/tools/Makefile
+          make -C kpn-exp/tools -j2 CC=gcc
+          test -x kpn-exp/tools/kptools
+          echo "KPN EXP core: $KPN_EXP_SHA"
+          cd common/out/arch/arm64/boot
+          test -s Image || { echo "::error::Kernel Image missing"; exit 1; }
+          ../../../../../kpn-exp/tools/kptools -p -i Image -k ../../../../../kpn-exp/kernel/kpimg -o Image-kpn-exp
+          test -s Image-kpn-exp || { echo "::error::KPN EXP did not produce a valid output file"; exit 1; }
+          ../../../../../kpn-exp/tools/kptools -l -i Image-kpn-exp
+          mv -f Image-kpn-exp Image
+          echo "::notice::Kernel patched using KPatch-Next-EXP core $KPN_EXP_SHA"
+
+      - name: 克隆 AnyKernel3 并打包
+        id: create_zip
+        run: |
+          cd kernel_workspace
+          git clone https://github.com/cctv18/AnyKernel3 --depth=1
+          rm -rf ./AnyKernel3/.git
+          cd AnyKernel3
+          cp ../common/out/arch/arm64/boot/Image ./Image
+          # Read-only post-flash capability diagnostics for Android's native root shell.
+          cp "$GITHUB_WORKSPACE/tools/op13-sukisu-capabilities.sh" ./op13-sukisu-capabilities.sh
+          chmod 0755 ./op13-sukisu-capabilities.sh
+          if [[ ! -f ./Image ]]; then
+            echo "未找到内核镜像文件，构建可能出错"
+            exit 1
+          fi
+          if [[ sukisu == "sukisu" ]]; then
+            KSU_TYPENAME="SukiSU"
+          elif [[ sukisu == "bakasu" ]]; then
+            KSU_TYPENAME="BakaSU"
+          elif [[ sukisu == "ksunext" ]]; then
+            KSU_TYPENAME="KSUNext"
+          elif [[ sukisu == "ksu" ]]; then
+            KSU_TYPENAME="KSU"
+          else
+            KSU_TYPENAME="none"
+          fi
+          if [[ "false" == "true" ]]; then
+            wget https://raw.githubusercontent.com/$GITHUB_REPOSITORY/refs/heads/$GITHUB_REF_NAME/zram.zip
+          fi
+          if [[ "true" == "true" ]]; then
+            {
+              echo "NoMount built-in driver v2.2.0 / wire protocol v22"
+              echo "Source: https://github.com/maxsteeel/nomount"
+              echo "Pinned source: bf1847f98fed382369c43bfd652cd93774b9b8e3"
+              echo "Kernel option: CONFIG_NOMOUNT=y"
+              echo "Userspace Metamodule: https://github.com/maxsteeel/nomount/releases/tag/v2.2.0"
+              echo "Install the matching v2.2.0 module separately in SukiSU Manager."
+              echo "Do not simultaneously activate a second Metamodule such as Mountify."
+              echo "Avoid NoMount's prebuilt LKM when the v22 driver is already built-in."
+              echo "SUSFS and KPN EXP VFS interactions require device-level testing."
+            } > NOMOUNT-BUILD-PROVENANCE.txt
+          fi
+          if [[ "true" == "true" ]]; then
+            # Do NOT bundle cctv18's unrelated KPN ZIP, which can mismatch
+            # our EXP kpimg's userspace ABI. Install the matching EXP module
+            # artifact separately after flashing and verifying the boot.
+            {
+              echo "KPatch-Next-EXP 0.13.14 external core"
+              echo "Pinned core: 8193f610d0105569437e17cc991459365dfa463a"
+              echo "Source: https://github.com/Zhanfg/KPatch-Next-EXP"
+              echo "Compatible Module-EXP CI: https://github.com/Zhanfg/KPatch-Next-Module-EXP/actions/runs/41296024607"
+              echo "No KPM module automatically embedded or loaded."
+              echo "Do not enable SukiSU internal KPM with this Image."
+            } > KPN-EXP-PROVENANCE.txt
+          fi
+          if [[ -n "op13-exp-smoke1" ]]; then
+            AK3_NAME=AnyKernel3_${KSU_TYPENAME}_${{ env.KSUVER }}_${{ env.KERNEL_VERSION }}_op13-exp-smoke1.zip
+          else
+            AK3_NAME=AnyKernel3_${KSU_TYPENAME}_${{ env.KSUVER }}_${{ env.KERNEL_VERSION }}_${{ env.KERNEL_NAME }}.zip
+          fi
+          zip -r ../$AK3_NAME ./*
+          echo "ak3name=$AK3_NAME" >> $GITHUB_OUTPUT
+          
+          #为AK3添加注释（调试信息）
+          if [[ -n "op13-exp-smoke1" ]]; then
+            FULL_VERSION=${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }}-op13-exp-smoke1
+          else
+            FULL_VERSION=${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }}-${{ env.KERNEL_NAME }}
+          fi
+          TIME_NOW="$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')"
+          echo "Author: $GITHUB_ACTOR" > ./ak3.log
+          echo "Repo: $GITHUB_REPOSITORY" >> ./ak3.log
+          echo "Branch: $GITHUB_REF_NAME" >> ./ak3.log
+          echo "Run ID: $GITHUB_RUN_ID" >> ./ak3.log
+          echo "Commit: $GITHUB_SHA" >> ./ak3.log
+          echo "Time: $TIME_NOW" >> ./ak3.log
+          echo "Kernel Ver: $FULL_VERSION" >> ./ak3.log
+          echo "KSU Branch: ${KSU_TYPENAME}" >> ./ak3.log
+          echo "KSU Ver: ${KSUVER}" >> ./ak3.log
+          echo "susfs: true" >> ./ak3.log
+          echo "External KPN EXP: true" >> ./ak3.log
+          echo "KPN EXP source commit: 8193f610d0105569437e17cc991459365dfa463a" >> ./ak3.log
+          echo "LZ4: true" >> ./ak3.log
+          echo "LZ4KD: false" >> ./ak3.log
+          echo "IPset: false" >> ./ak3.log
+          echo "BBR&Brutal: false" >> ./ak3.log
+          echo "Droidspaces: false" >> ./ak3.log
+          echo "ADIOS: true" >> ./ak3.log
+          echo "Re-Kernel: false" >> ./ak3.log
+          echo "NoMount built-in v2.2.0: true" >> ./ak3.log
+          echo "BBG: true" >> ./ak3.log
+          echo "SukiSU native KPM: false" >> ./ak3.log
+          zip -z ../$AK3_NAME < ./ak3.log
+          unzip -t "../$AK3_NAME" >/dev/null || { echo "::error::AK3 archive validation failed"; exit 1; }
+
+      - name: 上传 Ccache 调试日志
+        if: always() && false
+        uses: actions/upload-artifact@v7
+        with:
+          name: ccache-debug-log
+          path: ${{ github.workspace }}/kernel_workspace/ccache.log
+          archive: true
+
+      - name: 上传 ZIP 工件
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ github.workspace }}/kernel_workspace/AnyKernel*.zip
+          archive: false
