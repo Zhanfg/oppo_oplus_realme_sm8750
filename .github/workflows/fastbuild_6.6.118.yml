@@ -70,6 +70,11 @@ on:
         required: true
         type: boolean
         default: 'false'
+      nomount_enable:
+        description: '是否内置 NoMount v2.2.0 VFS 驱动（CONFIG_NOMOUNT=y；Metamodule 需另行安装）'
+        required: true
+        type: boolean
+        default: 'true'
       adios_enable:
         description: '是否启用ADIOS IO调度器支持(提升IO读写性能)'
         required: true
@@ -409,6 +414,42 @@ jobs:
           cp ../SukiSU_patch/other/zram/zram_patch/${{ env.KERNEL_VERSION }}/lz4kd.patch ./
           patch -p1 -F 3 < lz4kd.patch || true
           
+      - name: 集成 NoMount v2.2.0 内核 VFS 驱动
+        if: inputs.nomount_enable
+        env:
+          NOMOUNT_VERSION: v2.2.0
+          NOMOUNT_SHA: bf1847f98fed382369c43bfd652cd93774b9b8e3
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd kernel_workspace
+          # Use the immutable public release, not moving dev/master branches.
+          git clone --depth 1 --branch "$NOMOUNT_VERSION" \
+            https://github.com/maxsteeel/nomount.git NoMount
+          test "$(git -C NoMount rev-parse HEAD)" = "$NOMOUNT_SHA" || {
+            echo "::error::NoMount source does not match audited v2.2.0 SHA"
+            exit 1
+          }
+          grep -Fq '#define NOMOUNT_BASE_VERSION "22"' NoMount/kernel/src/nomount.h || {
+            echo "::error::NoMount protocol is not v22"
+            exit 1
+          }
+          test ! -e common/fs/nomount && test ! -L common/fs/nomount || {
+            echo "::error::fs/nomount already exists: cannot silently mix VFS implementations"
+            exit 1
+          }
+          ln -s ../../NoMount/kernel/src common/fs/nomount
+          test -f common/fs/nomount/Kconfig && test -f common/fs/nomount/nomount.c || exit 1
+          if ! grep -Fq 'source "fs/nomount/Kconfig"' common/fs/Kconfig; then
+            sed -i '/^endmenu$/i source "fs/nomount/Kconfig"' common/fs/Kconfig
+          fi
+          if ! grep -Fq 'obj-$(CONFIG_NOMOUNT) += nomount/' common/fs/Makefile; then
+            printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> common/fs/Makefile
+          fi
+          grep -Fq 'source "fs/nomount/Kconfig"' common/fs/Kconfig
+          grep -Fq 'obj-$(CONFIG_NOMOUNT) += nomount/' common/fs/Makefile
+          echo "::notice::NoMount v2.2.0, driver protocol v22, source $NOMOUNT_SHA integrated"
+
       - name: 添加SUSFS 配置项
         if: inputs.susfs_enable && inputs.ksu_type != 'none'
         run: |
@@ -440,6 +481,14 @@ jobs:
             if [[ "${{ github.event.inputs.susfs_enable }}" == "false" ]]; then
               echo "# CONFIG_KSU_SUSFS is not set" >> ./common/arch/arm64/configs/gki_defconfig
             fi
+          fi
+          # NoMount is independent of SUSFS and EXP KPM. It requires the
+          # Linux keyring subsystem used by the userspace nm v22 protocol.
+          if [[ "${{ github.event.inputs.nomount_enable }}" == "true" ]]; then
+            echo "CONFIG_KEYS=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_NOMOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          else
+            echo "# CONFIG_NOMOUNT is not set" >> ./common/arch/arm64/configs/gki_defconfig
           fi
           #添加对 Mountify (backslashxx/mountify) 模块的支持
           echo "CONFIG_TMPFS_XATTR=y" >> ./common/arch/arm64/configs/gki_defconfig
@@ -741,6 +790,12 @@ jobs:
           fi
           # Official OPlus HMBIRD scheduler must remain enabled in this OKI build.
           grep -q '^CONFIG_HMBIRD_SCHED=y$' out/.config || { echo "::error::HMBIRD/Fengchi disabled in final kernel config"; exit 1; }
+          if [[ "${{ github.event.inputs.nomount_enable }}" == "true" ]]; then
+            grep -qx 'CONFIG_KEYS=y' out/.config || { echo "::error::Linux Keyring disabled; NoMount cannot work"; exit 1; }
+            grep -qx 'CONFIG_NOMOUNT=y' out/.config || { echo "::error::NoMount not enabled in final kernel config"; exit 1; }
+            test -f fs/nomount/nomount.c || { echo "::error::NoMount VFS driver missing from kernel build tree"; exit 1; }
+            grep -Fq '#define NOMOUNT_BASE_VERSION "22"' fs/nomount/nomount.h || { echo "::error::NoMount protocol mismatched"; exit 1; }
+          fi
           # Fail the build if critical Spectre, BPF or memory-hardening protections regress.
           # This is a build-time regression gate, not a guarantee of runtime CPU mitigation.
           for security_config in \
@@ -882,6 +937,19 @@ jobs:
           if [[ "${{ github.event.inputs.lz4kd_enable }}" == "true" ]]; then
             wget https://raw.githubusercontent.com/$GITHUB_REPOSITORY/refs/heads/$GITHUB_REF_NAME/zram.zip
           fi
+          if [[ "${{ github.event.inputs.nomount_enable }}" == "true" ]]; then
+            {
+              echo "NoMount built-in driver v2.2.0 / wire protocol v22"
+              echo "Source: https://github.com/maxsteeel/nomount"
+              echo "Pinned source: bf1847f98fed382369c43bfd652cd93774b9b8e3"
+              echo "Kernel option: CONFIG_NOMOUNT=y"
+              echo "Userspace Metamodule: https://github.com/maxsteeel/nomount/releases/tag/v2.2.0"
+              echo "Install the matching v2.2.0 module separately in SukiSU Manager."
+              echo "Do not simultaneously activate a second Metamodule such as Mountify."
+              echo "Avoid NoMount's prebuilt LKM when the v22 driver is already built-in."
+              echo "SUSFS and KPN EXP VFS interactions require device-level testing."
+            } > NOMOUNT-BUILD-PROVENANCE.txt
+          fi
           if [[ "${{ github.event.inputs.kpm_enable }}" == "true" ]]; then
             # Do NOT bundle cctv18's unrelated KPN ZIP, which can mismatch
             # our EXP kpimg's userspace ABI. Install the matching EXP module
@@ -929,6 +997,7 @@ jobs:
           echo "Droidspaces: ${{ github.event.inputs.droidspaces_enable }}" >> ./ak3.log
           echo "ADIOS: ${{ github.event.inputs.adios_enable }}" >> ./ak3.log
           echo "Re-Kernel: ${{ github.event.inputs.rekernel_enable }}" >> ./ak3.log
+          echo "NoMount built-in v2.2.0: ${{ github.event.inputs.nomount_enable }}" >> ./ak3.log
           echo "BBG: ${{ github.event.inputs.baseband_guard }}" >> ./ak3.log
           echo "SukiSU native KPM: ${{ github.event.inputs.sukisu_kpm_enable }}" >> ./ak3.log
           zip -z ../$AK3_NAME < ./ak3.log
@@ -1016,6 +1085,7 @@ jobs:
           - Droidspaces 容器支持：${{ github.event.inputs.droidspaces_enable }}
           - ADIOS IO调度器支持：${{ github.event.inputs.adios_enable }}
           - Re-Kernel支持：${{ github.event.inputs.rekernel_enable }}
+          - NoMount 内置驱动 v2.2.0（协议 v22）：${{ github.event.inputs.nomount_enable }}
           - 内核级基带保护支持：${{ github.event.inputs.baseband_guard }}
           - BakaSU管理器下载：[BakaSU_CI](https://github.com/cctv18/BakaSU_CI/releases)
           - SukiSU Ultra管理器下载：[SukiSU-Ultra](https://github.com/SukiSU-Ultra/SukiSU-Ultra/releases)
