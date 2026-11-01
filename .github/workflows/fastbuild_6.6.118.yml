@@ -299,7 +299,25 @@ jobs:
             for feature_name in kernel_umount mount_hide selinux_hide avc_spoof sulog adb_root shell_su_adb_only; do
               grep -Fq "\"$feature_name\"" kernel/policy/feature.c || { echo "::error::Missing kernel feature ABI registration: $feature_name"; exit 1; }
             done
-            echo "::notice::SukiSU feature and extension source/registration checks passed."
+            # AVC is a feature (ID 10003), not a generic extension. Manager
+            # and ksud must use the same feature ABI; verify kernel-side pieces.
+            grep -Eq 'KSU_FEATURE_AVC_SPOOF[[:space:]]*=[[:space:]]*10003' uapi/feature.h || {
+              echo "::error::SukiSU AVC feature ID is incompatible with Manager/ksud"
+              exit 1
+            }
+            grep -Fq '.feature_id = KSU_FEATURE_AVC_SPOOF' kernel/feature/avc_spoof.c || {
+              echo "::error::AVC handler registration missing"
+              exit 1
+            }
+            grep -Fq 'slow_avc_audit' kernel/feature/avc_spoof.c || {
+              echo "::error::AVC audit hook target missing"
+              exit 1
+            }
+            grep -Fq 'ksu_avc_spoof_late_init();' kernel/core/init.c || {
+              echo "::error::AVC late init entry missing"
+              exit 1
+            }
+            echo "::notice::SukiSU feature/extension and AVC ABI checks passed."
           elif [[ ${{ github.event.inputs.ksu_type }} == "ksunext" ]]; then
             echo "正在配置KernelSU Next..."
             curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
