@@ -372,21 +372,7 @@ jobs:
             # OP13's task_mmu has only the braced smaps_rollup case-4 branch.
             # The legacy patch also carries a non-braced alternate: drop only
             # that inapplicable hunk, preserve the actual vendor case-4 fix.
-            python3 - <<'PY'
-            from pathlib import Path
-            src = Path("fs/proc/task_mmu.c").read_text()
-            if src.count("if (vma->vm_end > last_vma_end) {") != 1:
-                raise SystemExit("Unrecognized OP13 task_mmu layout")
-            p = Path("50_add_susfs_in_gki-android15-6.6.patch")
-            data = p.read_text()
-            start = "@@ -999,8 +1056,15 @@ static int show_smaps_rollup"
-            stop = "@@ -1021,8 +1074,15 @@ static int show_smaps_rollup"
-            a, b = data.find(start), data.find(stop)
-            if a < 0 or b <= a or data.count(start) != 1 or data.count(stop) != 1:
-                raise SystemExit("Unrecognized SUSFS patch")
-            p.write_text(data[:a] + data[b:])
-            print("OP13: skipped only the invalid non-braced smaps_rollup variant")
-            PY
+            python3 -c 'from pathlib import Path; src=Path("fs/proc/task_mmu.c").read_text(); p=Path("50_add_susfs_in_gki-android15-6.6.patch"); data=p.read_text(); first="@@ -999,8 +1056,15 @@ static int show_smaps_rollup"; second="@@ -1021,8 +1074,15 @@ static int show_smaps_rollup"; a=data.find(first); b=data.find(second); assert src.count("if (vma->vm_end > last_vma_end) {")==1, "Unknown OP13 layout"; assert a>=0 and b>a and data.count(first)==1 and data.count(second)==1, "Unknown SUSFS patch"; p.write_text(data[:a]+data[b:]); print("Removed only incompatible task_mmu hunk")'
             patch --batch --dry-run --forward -p1 -F 3 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch
             # Mandatory security patch: fail instead of producing an incomplete SUSFS build.
             patch --batch --forward -p1 -F 3 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch
