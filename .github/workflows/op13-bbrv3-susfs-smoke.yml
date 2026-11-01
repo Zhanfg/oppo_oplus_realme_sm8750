@@ -583,8 +583,10 @@ jobs:
           grep -Fq 'net/ipv4/tcp_bbr3.c' /tmp/op13-bbrv3.patch || exit 1
           # The patch changes 13 TCP files, including vendor-sensitive core
           # structures. Do not accept fuzz or reject files during this test.
+          python3 "$GITHUB_WORKSPACE/tools/op13-port-bbrv3.py" prepare /tmp/op13-bbrv3.patch .
           patch --batch --dry-run --forward --fuzz=0 -p1 < /tmp/op13-bbrv3.patch
           patch --batch --forward --fuzz=0 -p1 < /tmp/op13-bbrv3.patch
+          python3 "$GITHUB_WORKSPACE/tools/op13-port-bbrv3.py" finish /tmp/op13-bbrv3.patch .
           grep -Fq 'config TCP_CONG_BBR3' net/ipv4/Kconfig
           grep -Fq 'tcp_bbr3.o' net/ipv4/Makefile
           echo "CONFIG_TCP_CONG_BBR3=y" >> arch/arm64/configs/gki_defconfig
