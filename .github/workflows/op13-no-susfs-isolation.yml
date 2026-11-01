@@ -840,6 +840,12 @@ jobs:
           cp kpn-exp/kernel/include/preset.h kpn-exp/tools/preset.h
           cmp -s kpn-exp/kernel/include/preset.h kpn-exp/tools/preset.h
           grep -Fq '#define EXTRA_ALIGN 0x10' kpn-exp/tools/preset.h
+          # The pinned v0.13.14 tools/Makefile references sha256.o,
+          # but this revision has no tools/sha256.c and the host tool
+          # does not use that object. Mirror the reviewed PR #4 fix.
+          grep -Fxq 'objs += sha256.o' kpn-exp/tools/Makefile
+          test ! -f kpn-exp/tools/sha256.c
+          sed -i '/^objs += sha256\.o$/d' kpn-exp/tools/Makefile
           make -C kpn-exp/tools -j2 CC=gcc
           test -x kpn-exp/tools/kptools
           echo "KPN EXP core: $KPN_EXP_SHA"
