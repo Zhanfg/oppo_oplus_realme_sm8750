@@ -387,7 +387,9 @@ jobs:
               echo "::error::SUSFS UAF/RCU fix not found; refusing older source"
               exit 1
             fi
-            wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/other_patch/69_hide_stuff.patch -O ./common/69_hide_stuff.patch
+            # Do not apply legacy 69_hide_stuff.patch: it forges /proc maps
+            # entries using hard-coded 'lineage' and 'jit-zygote-cache' names,
+            # is unrelated to security hardening, and has partial-hunk hazards.
             cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch ./common/
             cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
             cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
@@ -406,9 +408,7 @@ jobs:
             # Mandatory security patch: fail instead of producing an incomplete SUSFS build.
             patch --batch --forward -p1 -F 3 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch
             test -f fs/susfs.c && test -f include/linux/susfs.h || { echo "::error::SUSFS sources are missing"; exit 1; }
-            if ! patch --batch --forward -p1 -N -F 3 < 69_hide_stuff.patch; then
-              echo "::warning::69_hide_stuff.patch failed; please check kernel patch compatibility"
-            fi
+            # Legacy 69_hide_stuff.patch intentionally NOT applied.
             cd ..
           else
             echo "已选择无内置KernelSU模式，跳过susfs配置..."
