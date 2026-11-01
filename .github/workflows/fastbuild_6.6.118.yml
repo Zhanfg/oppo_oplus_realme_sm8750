@@ -785,6 +785,7 @@ jobs:
           echo "ADIOS: ${{ github.event.inputs.adios_enable }}" >> ./ak3.log
           echo "Re-Kernel: ${{ github.event.inputs.rekernel_enable }}" >> ./ak3.log
           echo "BBG: ${{ github.event.inputs.baseband_guard }}" >> ./ak3.log
+          echo "SukiSU native KPM: ${{ github.event.inputs.sukisu_kpm_enable }}" >> ./ak3.log
           zip -z ../$AK3_NAME < ./ak3.log
           unzip -t "../$AK3_NAME" >/dev/null || { echo "::error::AK3 archive validation failed"; exit 1; }
 
@@ -861,6 +862,7 @@ jobs:
           - KSU分支：${{ env.KSU_TYPENAME }}
           - susfs支持：${{ github.event.inputs.susfs_enable }}
           - KPM支持 ：${{ github.event.inputs.kpm_enable }}
+          - SukiSU 内置 KPM：${{ github.event.inputs.sukisu_kpm_enable }}
           - LZ4支持：${{ github.event.inputs.lz4_enable }}
           - LZ4KD支持：${{ github.event.inputs.lz4kd_enable }}
           - 网络功能增强：${{ github.event.inputs.better_net }}
