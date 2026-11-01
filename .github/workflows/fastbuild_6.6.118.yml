@@ -284,6 +284,16 @@ jobs:
             for ext in extension/extension.c extension/kpm.c extension/cpu_spoof.c extension/umount_paths.c extension/dynamic_manager.c extension/susfs_extension.c extension/version_spoof.c; do
               test -f "kernel/$ext" || { echo "::error::Missing SukiSU extension source: $ext"; exit 1; }
             done
+            # The Manager settings screen uses the *feature* API, not the extension API.
+            for feature_src in feature/kernel_umount.c feature/mount_hide.c feature/selinux_hide.c feature/avc_spoof.c feature/sulog.c feature/adb_root.c feature/shell_su_adb_only.c policy/feature.c hook/setuid_hook.c hook/syscall_hook_manager.c; do
+              test -f "kernel/$feature_src" || { echo "::error::Missing SukiSU settings feature: $feature_src"; exit 1; }
+            done
+            grep -Fq 'ksu_mount_hide_init();' kernel/hook/setuid_hook.c || { echo "::error::SukiSU mount_hide initialization missing"; exit 1; }
+            grep -Fq 'ksu_setuid_hook_init();' kernel/hook/syscall_hook_manager.c || { echo "::error::SukiSU setuid mount-hide hook chain missing"; exit 1; }
+            for feature_name in kernel_umount mount_hide selinux_hide avc_spoof sulog adb_root shell_su_adb_only; do
+              grep -Fq "\"$feature_name\"" kernel/policy/feature.c || { echo "::error::Missing kernel feature ABI registration: $feature_name"; exit 1; }
+            done
+            echo "::notice::SukiSU feature and extension source/registration checks passed."
           elif [[ ${{ github.event.inputs.ksu_type }} == "ksunext" ]]; then
             echo "正在配置KernelSU Next..."
             curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
@@ -413,7 +423,13 @@ jobs:
           # SukiSU bundles CPU spoof, Umount paths, dynamic manager, SUSFS and
           # version spoof extensions in its kernel/Kbuild. KPM needs CONFIG_KPM.
           if [[ "${{ github.event.inputs.ksu_type }}" == "sukisu" ]]; then
+            # Required by SukiSU syscall hooks, mount_hide symbol resolution,
+            # AVC spoofing and per-app policy / default module unmount.
+            echo "CONFIG_KPROBES=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_KALLSYMS=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_KALLSYMS_ALL=y" >> ./common/arch/arm64/configs/gki_defconfig
             echo "# CONFIG_KSU_DISABLE_MANAGER is not set" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "# CONFIG_KSU_DISABLE_POLICY is not set" >> ./common/arch/arm64/configs/gki_defconfig
             if [[ "${{ github.event.inputs.sukisu_kpm_enable }}" == "true" ]]; then
               echo "CONFIG_KPM=y" >> ./common/arch/arm64/configs/gki_defconfig
               echo "CONFIG_KALLSYMS=y" >> ./common/arch/arm64/configs/gki_defconfig
@@ -708,6 +724,13 @@ jobs:
           echo "::notice::Spectre-BHB and eBPF baseline verified; runtime mitigation must be checked on-device."
           if [[ "${{ github.event.inputs.ksu_type }}" == "sukisu" ]]; then
             grep -q '^CONFIG_KSU=y$' out/.config || { echo "::error::SukiSU kernel not enabled"; exit 1; }
+            for feature_config in CONFIG_KPROBES CONFIG_KALLSYMS CONFIG_KALLSYMS_ALL CONFIG_EXT4_FS; do
+              grep -qx "${feature_config}=y" out/.config || { echo "::error::SukiSU feature prerequisite missing: ${feature_config}"; exit 1; }
+            done
+            if grep -q '^CONFIG_KSU_DISABLE_POLICY=y$' out/.config; then
+              echo "::error::SukiSU per-app module unmount policy disabled"
+              exit 1
+            fi
             if [[ "${{ github.event.inputs.sukisu_kpm_enable }}" == "true" ]]; then
               grep -q '^CONFIG_KPM=y$' out/.config || { echo "::error::SukiSU KPM missing from kernel config"; exit 1; }
             fi
@@ -758,6 +781,9 @@ jobs:
           rm -rf ./AnyKernel3/.git
           cd AnyKernel3
           cp ../common/out/arch/arm64/boot/Image ./Image
+          # Read-only post-flash capability diagnostics for Android's native root shell.
+          cp "$GITHUB_WORKSPACE/tools/op13-sukisu-capabilities.sh" ./op13-sukisu-capabilities.sh
+          chmod 0755 ./op13-sukisu-capabilities.sh
           if [[ ! -f ./Image ]]; then
             echo "未找到内核镜像文件，构建可能出错"
             exit 1
