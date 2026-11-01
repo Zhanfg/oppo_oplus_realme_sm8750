@@ -48,6 +48,29 @@ echo "Interpretation: 'supported' means registered. It does not establish that"
 echo "an AVC audit hook was successfully installed or that Manager's JNI can set it."
 echo
 
+echo "--- NoMount built-in driver / userspace protocol (read-only) ---"
+NM=""
+if command -v nm >/dev/null 2>&1; then
+    NM="$(command -v nm)"
+elif [ -x /data/adb/ksu/bin/nm ]; then
+    NM=/data/adb/ksu/bin/nm
+elif [ -x /data/adb/modules/nomount/bin/nm ]; then
+    NM=/data/adb/modules/nomount/bin/nm
+fi
+if [ -n "$NM" ]; then
+    echo "NoMount CLI: $NM"
+    "$NM" version 2>&1 || echo "NoMount v22 driver/CLI handshake failed"
+    if [ -r /proc/modules ] && grep -q '^nomount ' /proc/modules; then
+        echo "NoMount driver mode: LKM"
+    else
+        echo "NoMount driver mode: not listed as LKM (built-in candidate)"
+    fi
+else
+    echo "NoMount CLI is not installed; built-in support cannot be probed from userspace yet."
+    echo "Install the matching NoMount v2.2.0 Metamodule after flashing."
+fi
+echo
+
 echo "--- SUSFS kernel interface ---"
 "$KSUD" susfs status 2>&1 || echo "SUSFS probe unavailable; check compatibility of ksud, kernel and SUSFS variant"
 
