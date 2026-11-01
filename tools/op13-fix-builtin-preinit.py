@@ -1,60 +1,46 @@
 #!/usr/bin/env python3
-"""Build-only SukiSU builtin preinit compilation unit compatibility probe.
+"""Fail-closed SukiSU builtin Preinit source-layout audit (pinned SHA).
 
-Do not use for a release without a full binary/boot audit.
-Checks exact upstream structure, then compiles preinit into KernelSU's
-ksu_main unity translation unit so all kernel compat types are available.
+The 2026-11-01 SukiSU builtin commit rewrote preinit as a standalone C
+translation unit using an embedded nolibc runner. Do not rewrite it into a
+unity build or disable Preinit to work around incompatible older commits.
 """
 from pathlib import Path
 
 root = Path("kernel_workspace/KernelSU/kernel")
-mk = root / "Makefile"
-main = root / "ksu_main.c"
-pre = root / "preinit/preinit.c"
-header = root / "preinit/preinit.h"
-blob = root / "preinit/blob.S"
-for p in (mk, main, pre, header, blob):
-    if not p.is_file():
-        raise SystemExit(f"Missing SukiSU builtin path: {p}")
+checks = {
+    "Makefile": [
+        "ksu-y += preinit/preinit.o preinit/blob.o",
+        "$(obj)/preinit/runner.elf:",
+    ],
+    "ksu_main.c": [
+        '#include "preinit/preinit.h"',
+        "ksu_preinit_init();",
+    ],
+    "preinit/preinit.c": [
+        "#include <linux/err.h>",
+        "void __init ksu_preinit_init(void)",
+        "int ksu_setup_preinit_file(",
+        "ksu_preinit_handle_post_execveat(",
+        "ksu_preinit_runner_start",
+        "ksu_preinit_runner_end",
+    ],
+    "preinit/blob.S": [".incbin KSU_PREINIT_RUNNER_BIN"],
+    "preinit/runner/runner.c": [
+        '#include "nolibc.h"',
+        "ksu_preinit:",
+    ],
+}
+for rel, terms in checks.items():
+    path = root / rel
+    if not path.is_file():
+        raise SystemExit(f"Missing pinned SukiSU preinit file: {rel}")
+    data = path.read_text()
+    for term in terms:
+        if term not in data:
+            raise SystemExit(f"Unexpected builtin Preinit ABI in {rel}: {term}")
 
-m = mk.read_text()
-if m.count("ksu-y += preinit/preinit.o preinit/blob.o") != 1:
-    raise SystemExit("Unexpected upstream KSU preinit Makefile")
-m = m.replace("ksu-y += preinit/preinit.o preinit/blob.o",
-              "ksu-y += preinit/blob.o", 1)
-mk.write_text(m)
+if "constexpr" in (root / "preinit/preinit.c").read_text():
+    raise SystemExit("C++ expressions found in pinned standalone Preinit source")
 
-c = pre.read_text()
-if c.count("constexpr char expected[]") != 2:
-    raise SystemExit("Unknown C++ constexpr uses in builtin preinit")
-c = c.replace("constexpr char expected[]", "static const char expected[]")
-if c.count("= nullptr;") != 1 or c.count(", nullptr,") != 2:
-    raise SystemExit("Unknown C++ null pointer expressions in builtin preinit")
-c = c.replace("= nullptr;", "= NULL;").replace(", nullptr,", ", NULL,")
-c = '''/* Link runner blob from preinit/blob.S without file-scope integer init. */
-extern const unsigned char ksu_preinit_runner_start[];
-extern const unsigned char ksu_preinit_runner_end[];
-#define runner_binary ksu_preinit_runner_start
-#define runner_binary_len ((size_t)(ksu_preinit_runner_end - ksu_preinit_runner_start))
-''' + c
-pre.write_text(c)
-
-s = main.read_text()
-anchor = '''#ifdef CONFIG_KSU_SUSFS
-#include "preinit/preinit.h"
-#else
-#include "preinit/common/preinit.h"
-#endif'''
-if s.count(anchor) != 1:
-    raise SystemExit("Unexpected SukiSU builtin preinit integration layout")
-new = '''#ifdef CONFIG_KSU_SUSFS
-#include "preinit/preinit.h"
-#ifndef KSU_NO_PREINIT
-/* Build as part of the existing KernelSU unity translation unit. */
-#include "preinit/preinit.c"
-#endif
-#else
-#include "preinit/common/preinit.h"
-#endif'''
-main.write_text(s.replace(anchor, new, 1))
-print("SukiSU builtin preinit integrated with parent kernel compile context")
+print("Pinned SukiSU builtin Preinit: standalone C unit + embedded nolibc runner; no source edits needed.")
