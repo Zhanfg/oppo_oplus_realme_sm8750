@@ -280,6 +280,14 @@ jobs:
             cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch ./common/
             cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
             cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
+            # SukiSU Ultra main does not declare CONFIG_KSU_SUSFS: append
+            # upstream SUSFS Kconfig to its Kconfig so defconfig honors
+            # SUSFS instead of silently discarding every requested switch.
+            if [[ "sukisu" == "sukisu" ]]; then
+              cp "$GITHUB_WORKSPACE/tools/op13-susfs.Kconfig" ./common/fs/op13_susfs.Kconfig
+              grep -Fq 'source "fs/op13_susfs.Kconfig"' ./KernelSU/kernel/Kconfig ||
+                echo 'source "fs/op13_susfs.Kconfig"' >> ./KernelSU/kernel/Kconfig
+            fi
             cd ./common
             # OP13's task_mmu has only the braced smaps_rollup case-4 branch.
             # The legacy patch also carries a non-braced alternate: drop only
