@@ -424,6 +424,8 @@ jobs:
           else
             echo "# CONFIG_KPM is not set" >> ./common/arch/arm64/configs/gki_defconfig
           fi
+          # Explicitly retain the arm64 Spectre-BHB mitigation.
+          echo "CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY=y" >> ./common/arch/arm64/configs/gki_defconfig
           # 开启O2编译优化配置
           echo "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y" >> ./common/arch/arm64/configs/gki_defconfig
           #禁用 defconfig 检查
@@ -678,6 +680,32 @@ jobs:
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error gki_defconfig &&
           # Official OPlus HMBIRD scheduler must remain enabled in this OKI build.
           grep -q '^CONFIG_HMBIRD_SCHED=y$' out/.config || { echo "::error::HMBIRD/Fengchi disabled in final kernel config"; exit 1; }
+          # Fail the build if critical Spectre, BPF or memory-hardening protections regress.
+          # This is a build-time regression gate, not a guarantee of runtime CPU mitigation.
+          for security_config in \
+            CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY \
+            CONFIG_ARM64_SW_TTBR0_PAN \
+            CONFIG_BPF_JIT_ALWAYS_ON \
+            CONFIG_RANDOMIZE_BASE \
+            CONFIG_SHADOW_CALL_STACK \
+            CONFIG_CFI_CLANG \
+            CONFIG_HARDENED_USERCOPY; do
+            grep -qx "${security_config}=y" out/.config || {
+              echo "::error::Security regression: ${security_config} is not enabled"
+              exit 1
+            }
+          done
+          grep -q 'static bool is_spectre_bhb_safe' arch/arm64/kernel/proton-pack.c &&
+          grep -q 'if (is_spectre_bhb_safe(scope))' arch/arm64/kernel/proton-pack.c &&
+          grep -q 'supports_clearbhb' arch/arm64/kernel/proton-pack.c || {
+            echo "::error::Spectre-BHB CPU detection or mitigation source is missing"
+            exit 1
+          }
+          grep -q 'sanitize_speculative_path' kernel/bpf/verifier.c || {
+            echo "::error::eBPF verifier Spectre-v1 speculative sanitizer is missing"
+            exit 1
+          }
+          echo "::notice::Spectre-BHB and eBPF baseline verified; runtime mitigation must be checked on-device."
           if [[ "${{ github.event.inputs.ksu_type }}" == "sukisu" ]]; then
             grep -q '^CONFIG_KSU=y$' out/.config || { echo "::error::SukiSU kernel not enabled"; exit 1; }
             if [[ "${{ github.event.inputs.sukisu_kpm_enable }}" == "true" ]]; then
