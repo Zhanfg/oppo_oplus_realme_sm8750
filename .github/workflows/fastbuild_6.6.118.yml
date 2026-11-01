@@ -369,6 +369,25 @@ jobs:
             cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
             cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
             cd ./common
+            # OP13's task_mmu has only the braced smaps_rollup case-4 branch.
+            # The legacy patch also carries a non-braced alternate: drop only
+            # that inapplicable hunk, preserve the actual vendor case-4 fix.
+            python3 - <<'PY'
+            from pathlib import Path
+            src = Path("fs/proc/task_mmu.c").read_text()
+            if src.count("if (vma->vm_end > last_vma_end) {") != 1:
+                raise SystemExit("Unrecognized OP13 task_mmu layout")
+            p = Path("50_add_susfs_in_gki-android15-6.6.patch")
+            data = p.read_text()
+            start = "@@ -999,8 +1056,15 @@ static int show_smaps_rollup"
+            stop = "@@ -1021,8 +1074,15 @@ static int show_smaps_rollup"
+            a, b = data.find(start), data.find(stop)
+            if a < 0 or b <= a or data.count(start) != 1 or data.count(stop) != 1:
+                raise SystemExit("Unrecognized SUSFS patch")
+            p.write_text(data[:a] + data[b:])
+            print("OP13: skipped only the invalid non-braced smaps_rollup variant")
+            PY
+            patch --batch --dry-run --forward -p1 -F 3 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch
             # Mandatory security patch: fail instead of producing an incomplete SUSFS build.
             patch --batch --forward -p1 -F 3 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch
             test -f fs/susfs.c && test -f include/linux/susfs.h || { echo "::error::SUSFS sources are missing"; exit 1; }
