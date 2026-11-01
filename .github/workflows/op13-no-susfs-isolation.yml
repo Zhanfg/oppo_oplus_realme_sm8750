@@ -833,6 +833,15 @@ jobs:
             echo "::error::EXP kpimg missing the Nohello compatibility symbol"
             exit 1
           }
+          # The EXP commit includes preset.h in two tool sources but does not
+          # ship or generate it. Both only include the header and reference no
+          # preset declarations. Generate the empty header for this exact SHA.
+          test ! -e kpn-exp/tools/preset.h || {
+            echo "::error::Unexpected upstream preset.h contents; re-audit build"
+            exit 1
+          }
+          test "$(grep -l '#include "preset.h"' kpn-exp/tools/{kptools,kallsym}.c | wc -l)" -eq 2
+          printf '/* No preset entries at this pinned KPN EXP commit. */\\n' > kpn-exp/tools/preset.h
           make -C kpn-exp/tools -j2 CC=gcc
           test -x kpn-exp/tools/kptools
           echo "KPN EXP core: $KPN_EXP_SHA"
