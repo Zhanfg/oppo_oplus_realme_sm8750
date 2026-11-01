@@ -1,0 +1,41 @@
+name: OP13 one-shot first-build dispatcher
+on:
+  push:
+    branches:
+      - fix/op13-6.6.118-upstream-scheduler-20261101
+    paths:
+      - .github/workflows/op13-first-build-launcher.yml
+permissions:
+  contents: read
+  actions: write
+jobs:
+  dispatch-first-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Dispatch pinned first-build configuration on this branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BUILD_REF: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/$GH_REPO/actions/workflows/fastbuild_6.6.118.yml/dispatches" \
+            -f ref="$BUILD_REF" \
+            -f inputs[ksu_type]=sukisu \
+            -f inputs[sukisu_kpm_enable]=false \
+            -f inputs[susfs_enable]=true \
+            -f inputs[kpm_enable]=true \
+            -f inputs[lz4_enable]=true \
+            -f inputs[lz4kd_enable]=false \
+            -f inputs[bbr_enable]=false \
+            -f inputs[droidspaces_enable]=false \
+            -f inputs[better_net]=false \
+            -f inputs[nomount_enable]=true \
+            -f inputs[adios_enable]=true \
+            -f inputs[rekernel_enable]=false \
+            -f inputs[baseband_guard]=true \
+            -f inputs[ccache_update]=false \
+            -f inputs[ccache_debug]=false \
+            -f inputs[kernel_suffix]=op13-exp-smoke1
+          echo "First-build dispatch accepted for $GH_REPO@$BUILD_REF"
