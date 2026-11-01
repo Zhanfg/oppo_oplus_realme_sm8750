@@ -47,6 +47,11 @@ on:
         required: true
         type: boolean
         default: 'false'
+      bbrv3_enable:
+        description: 'BBRv3 独立 backport 测试（与 BBRv1 并存，仍保持 CUBIC 默认）'
+        required: true
+        type: boolean
+        default: 'true'
       bbr_enable:
         description: "是否启用bbr算法(优化上行数据,对手机日用无太大意义甚至可能负优化;false关闭,true仅加入算法,default启用算法并设为默认)"
         required: true
@@ -363,30 +368,32 @@ jobs:
           cd kernel_workspace
           if [[ ${{ github.event.inputs.ksu_type }} != "none" ]]; then
             echo "正在添加susfs补丁..."
-            git clone --depth=1 https://github.com/cctv18/susfs4oki.git susfs4ksu -b oki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
+            # Test the current official GKI SUSFS instead of cctv's 2026-10-15 OKI snapshot.
+            # Mirror is an explicit fallback to a GitLab upstream merge on 2026-10-31.
+            if git clone --depth=1 --branch gki-android15-6.6 https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu; then
+              echo "SUSFS_SOURCE=gitlab/simonpunk" >> "$GITHUB_ENV"
+            else
+              rm -rf susfs4ksu
+              git clone --depth=1 --branch gki-android15-6.6 https://github.com/Artecxyz/susfs4ksu.git susfs4ksu
+              echo "SUSFS_SOURCE=github/Artecxyz-mirror" >> "$GITHUB_ENV"
+            fi
+            SUSFS_SHA=$(git -C susfs4ksu rev-parse HEAD)
+            echo "SUSFS_SHA=$SUSFS_SHA" >> "$GITHUB_ENV"
+            echo "::notice::Latest candidate SUSFS gki-android15-6.6 SHA: $SUSFS_SHA"
+            test -f susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch
+            test -f susfs4ksu/kernel_patches/fs/susfs.c
+            # The latest branch must carry the post-2026-10-27 RCU lifetime fix.
+            if ! grep -Fq 'synchronize_rcu();' susfs4ksu/kernel_patches/fs/susfs.c; then
+              echo "::error::SUSFS UAF/RCU fix not found; refusing older source"
+              exit 1
+            fi
             wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/other_patch/69_hide_stuff.patch -O ./common/69_hide_stuff.patch
             cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch ./common/
             cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
             cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
             cd ./common
-            # OP13's task_mmu has only the braced smaps_rollup case-4 branch.
-            # The legacy patch also carries a non-braced alternate: drop only
-            # that inapplicable hunk, preserve the actual vendor case-4 fix.
-            python3 - <<'PY'
-            from pathlib import Path
-            src = Path("fs/proc/task_mmu.c").read_text()
-            if src.count("if (vma->vm_end > last_vma_end) {") != 1:
-                raise SystemExit("Unrecognized OP13 task_mmu layout")
-            p = Path("50_add_susfs_in_gki-android15-6.6.patch")
-            data = p.read_text()
-            start = "@@ -999,8 +1056,15 @@ static int show_smaps_rollup"
-            stop = "@@ -1021,8 +1074,15 @@ static int show_smaps_rollup"
-            a, b = data.find(start), data.find(stop)
-            if a < 0 or b <= a or data.count(start) != 1 or data.count(stop) != 1:
-                raise SystemExit("Unrecognized SUSFS patch")
-            p.write_text(data[:a] + data[b:])
-            print("OP13: skipped only the invalid non-braced smaps_rollup variant")
-            PY
+            # Latest upstream has the matching braced Case-4 implementation.
+            # Fail fast on context drift instead of silently leaving partial hooks.
             patch --batch --dry-run --forward -p1 -F 3 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch
             # Mandatory security patch: fail instead of producing an incomplete SUSFS build.
             patch --batch --forward -p1 -F 3 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch
@@ -647,6 +654,27 @@ jobs:
             fi
           fi
 
+      - name: 移植 Google BBRv3 至 Android 15 / Linux 6.6
+        if: inputs.bbrv3_enable
+        shell: bash
+        env:
+          BBR3_PATCH_SHA: c78291aeb0dca025f21e6b197e0aa4fde42e065d
+        run: |
+          set -euo pipefail
+          cd kernel_workspace/common
+          curl -fL --retry 3 -o /tmp/op13-bbrv3.patch \
+            "https://raw.githubusercontent.com/WildKernels/kernel_patches/$BBR3_PATCH_SHA/common/bbrv3/0001-net-tcp-backport-BBRv3-to-android15-6.6.patch"
+          test -s /tmp/op13-bbrv3.patch
+          grep -Fq 'net/ipv4/tcp_bbr3.c' /tmp/op13-bbrv3.patch || exit 1
+          # The patch changes 13 TCP files, including vendor-sensitive core
+          # structures. Do not accept fuzz or reject files during this test.
+          patch --batch --dry-run --forward --fuzz=0 -p1 < /tmp/op13-bbrv3.patch
+          patch --batch --forward --fuzz=0 -p1 < /tmp/op13-bbrv3.patch
+          grep -Fq 'config TCP_CONG_BBR3' net/ipv4/Kconfig
+          grep -Fq 'tcp_bbr3.o' net/ipv4/Makefile
+          echo "CONFIG_TCP_CONG_BBR3=y" >> arch/arm64/configs/gki_defconfig
+          echo "::notice::BBRv3 backport installed next to existing BBRv1; CUBIC remains default."
+
       - name: 启用 Droidspaces 容器支持
         run: |
           if [[ "${{ github.event.inputs.droidspaces_enable }}" != "false" ]]; then
@@ -817,6 +845,12 @@ jobs:
             make -j$(nproc --all) LLVM=1 ARCH=arm64 O=out headers_install
             test -f out/usr/include/linux/unistd.h || {
               echo "::error::SukiSU preinit UAPI headers unavailable; refusing a silently reduced build"
+              exit 1
+            }
+          fi
+          if [[ "${{ github.event.inputs.bbrv3_enable }}" == "true" ]]; then
+            grep -qx 'CONFIG_TCP_CONG_BBR3=y' out/.config || {
+              echo "::error::BBRv3 not enabled in the generated kernel configuration"
               exit 1
             }
           fi
@@ -1026,6 +1060,8 @@ jobs:
           echo "LZ4KD: ${{ github.event.inputs.lz4kd_enable }}" >> ./ak3.log
           echo "IPset: ${{ github.event.inputs.better_net }}" >> ./ak3.log
           echo "BBR&Brutal: ${{ github.event.inputs.bbr_enable }}" >> ./ak3.log
+          echo "BBRv3 backport: ${{ github.event.inputs.bbrv3_enable }}" >> ./ak3.log
+          echo "SUSFS source SHA: ${{ env.SUSFS_SHA }}" >> ./ak3.log
           echo "Droidspaces: ${{ github.event.inputs.droidspaces_enable }}" >> ./ak3.log
           echo "ADIOS: ${{ github.event.inputs.adios_enable }}" >> ./ak3.log
           echo "Re-Kernel: ${{ github.event.inputs.rekernel_enable }}" >> ./ak3.log
@@ -1114,6 +1150,8 @@ jobs:
           - LZ4KD支持：${{ github.event.inputs.lz4kd_enable }}
           - 网络功能增强：${{ github.event.inputs.better_net }}
           - BBR/Brutal 等拥塞控制算法支持：${{ github.event.inputs.bbr_enable }}
+          - BBRv3（独立，保留 v1）：${{ github.event.inputs.bbrv3_enable }}
+          - SUSFS 源码提交：${{ env.SUSFS_SHA }}
           - Droidspaces 容器支持：${{ github.event.inputs.droidspaces_enable }}
           - ADIOS IO调度器支持：${{ github.event.inputs.adios_enable }}
           - Re-Kernel支持：${{ github.event.inputs.rekernel_enable }}
