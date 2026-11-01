@@ -111,6 +111,13 @@ jobs:
       actions: write
       contents: read
     steps:
+      # Checkout is required because the AK3 packaging step bundles
+      # tools/op13-sukisu-capabilities.sh from the workflow repository.
+      - name: Checkout AK3 workflow repository and diagnostic tools
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
       - name: 安装环境依赖+初始化源码仓库及llvm-Clang18工具链
         run: |
           rm -rf kernel_workspace
