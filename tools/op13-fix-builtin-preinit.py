@@ -28,8 +28,8 @@ c = pre.read_text()
 if c.count("constexpr char expected[]") != 2:
     raise SystemExit("Unknown C++ constexpr uses in builtin preinit")
 c = c.replace("constexpr char expected[]", "static const char expected[]")
-if c.count("nullptr") != 1:
-    raise SystemExit("Unexpected nullptr uses")
+if c.count("nullptr") != 2:
+    raise SystemExit("Unexpected nullptr uses in two kthread_run calls")
 c = c.replace("nullptr", "NULL")
 c = '''/* Link runner blob from preinit/blob.S without file-scope integer init. */
 extern const unsigned char ksu_preinit_runner_start[];
